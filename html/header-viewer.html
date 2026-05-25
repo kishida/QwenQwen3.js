@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>GGUF Header Viewer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Consolas', 'Courier New', monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+h1 { color: #00d4ff; margin-bottom: 20px; font-size: 1.5em; }
+h2 { color: #7cfc00; margin: 20px 0 10px; font-size: 1.1em; border-bottom: 1px solid #333; padding-bottom: 5px; }
+.container { max-width: 1200px; margin: 0 auto; }
+.file-input { margin-bottom: 20px; }
+.file-input input { background: #16213e; color: #e0e0e0; padding: 10px 15px; border: 1px solid #444; border-radius: 4px; cursor: pointer; }
+.file-info { background: #16213e; padding: 15px; border-radius: 4px; margin-bottom: 20px; display: none; }
+.file-info.show { display: block; }
+.info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 8px; }
+.info-item { padding: 4px 0; }
+.info-key { color: #ff6b6b; }
+.info-val { color: #ffd93d; }
+table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.85em; }
+th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #333; }
+th { background: #16213e; color: #7cfc00; position: sticky; top: 0; }
+tr:hover { background: #1a1a3e; }
+.type-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 0.8em; }
+.type-F32 { background: #1e3a5f; color: #4fc3f7; }
+.type-F16 { background: #1e3a5f; color: #4dd0e1; }
+.type-Q8_0 { background: #3e1e5f; color: #ce93d8; }
+.type-Q4_0, .type-Q4_1 { background: #1e5f3e; color: #81c784; }
+.type-Q5_0, .type-Q5_1 { background: #1e5f3e; color: #a5d6a7; }
+.type-unknown { background: #5f1e1e; color: #ef9a9a; }
+.shape-cell { color: #ffd93d; font-family: monospace; }
+.size-cell { text-align: right; color: #ff9800; }
+.progress-bar { width: 100%; height: 20px; background: #16213e; border-radius: 4px; overflow: hidden; margin: 10px 0; display: none; }
+.progress-fill { height: 100%; background: linear-gradient(90deg, #00d4ff, #7cfc00); width: 0%; transition: width 0.3s; }
+.error { color: #ff6b6b; padding: 10px; background: #2a1a1e; border-radius: 4px; margin-top: 10px; display: none; }
+.arch-section { background: #16213e; padding: 15px; border-radius: 4px; margin-bottom: 20px; }
+.kv-table td:first-child { color: #ff6b6b; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kv-table td:nth-child(2) { color: #ffd93d; min-width: 100px; }
+.kv-table td:last-child { color: #e0e0e0; word-break: break-all; max-width: 500px; overflow: hidden; text-overflow: ellipsis; }
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>GGUF Header Viewer</h1>
+
+    <div class="file-input">
+        <input type="file" id="fileInput" accept=".gguf">
+    </div>
+
+    <div class="progress-bar" id="progressBar">
+        <div class="progress-fill" id="progressFill"></div>
+    </div>
+
+    <div class="error" id="errorMsg"></div>
+
+    <div class="file-info" id="headerInfo">
+        <h2>ファイル情報</h2>
+        <div class="info-grid" id="headerGrid"></div>
+    </div>
+
+    <div class="arch-section" id="archSection" style="display:none;">
+        <h2>アーキテクチャパラメータ</h2>
+        <div class="info-grid" id="archGrid"></div>
+    </div>
+
+    <div id="kvSection">
+        <h2>KV メタデータ (<span id="kvCount">0</span>)</h2>
+        <table class="kv-table">
+            <thead><tr><th>#</th><th>Key</th><th>Type</th><th>Value</th></tr></thead>
+            <tbody id="kvBody"></tbody>
+        </table>
+    </div>
+
+    <div id="tensorSection">
+        <h2>テンソル (<span id="tensorCount">0</span>)</h2>
+        <table>
+            <thead><tr><th>#</th><th>Name</th><th>Shape</th><th>Type</th><th>Size</th></tr></thead>
+            <tbody id="tensorBody"></tbody>
+        </table>
+    </div>
+</div>
+
+<script src="../src/gguf.js"></script>
+<script>
+const fileInput = document.getElementById('fileInput');
+const progressBar = document.getElementById('progressBar');
+const progressFill = document.getElementById('progressFill');
+const errorMsg = document.getElementById('errorMsg');
+
+fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    hideError();
+    progressBar.style.display = 'block';
+    progressFill.style.width = '10%';
+
+    try {
+        // Read file as ArrayBuffer (no copy, direct reference)
+        const buffer = await file.arrayBuffer();
+        progressFill.style.width = '50%';
+
+        // Parse GGUF header
+        const reader = new GGUFReader(buffer);
+        progressFill.style.width = '80%';
+
+        displayHeader(reader, file);
+        displayArch(reader);
+        displayKV(reader);
+        displayTensors(reader);
+
+        progressFill.style.width = '100%';
+        setTimeout(() => { progressBar.style.display = 'none'; }, 500);
+    } catch (err) {
+        showError(err.message || err.toString());
+        progressBar.style.display = 'none';
+    }
+});
+
+function displayHeader(reader, file) {
+    const header = reader.getHeader();
+    const grid = document.getElementById('headerGrid');
+    const items = [
+        ['ファイル名', file.name],
+        ['ファイルサイズ', formatBytes(header.fileSize)],
+        ['GGUF バージョン', header.version],
+        ['テンソル数', header.tensorCount.toLocaleString()],
+        ['KV 数', header.kvCount.toLocaleString()],
+    ];
+    grid.innerHTML = items.map(([k, v]) =>
+        `<div class="info-item"><span class="info-key">${k}:</span> <span class="info-val">${v}</span></div>`
+    ).join('');
+    document.getElementById('headerInfo').classList.add('show');
+}
+
+function displayArch(reader) {
+    const arch = reader.getArch();
+    if (!arch.architecture || arch.architecture === 'unknown') return;
+
+    const grid = document.getElementById('archGrid');
+    const items = [
+        ['architecture', arch.architecture],
+        ['vocab_size', arch.vocabSize?.toLocaleString()],
+        ['context_length', arch.contextLength?.toLocaleString()],
+        ['embedding_length', arch.embeddingLength],
+        ['block_count', arch.blockCount],
+        ['feed_forward_length', arch.feedForwardLength?.toLocaleString()],
+        ['attention.head_count', arch.headCount],
+        ['attention.head_count_kv', arch.headCountKV],
+        ['layer_norm_rms_epsilon', arch.layerNormRmsEps],
+        ['rope.freq_base', arch.ropeFreqBase],
+    ];
+
+    // Calculate head dim if available
+    if (arch.headCount && arch.embeddingLength) {
+        items.push(['head_dim (calc)', Math.round(arch.embeddingLength / arch.headCount)]);
+    }
+
+    grid.innerHTML = items.map(([k, v]) =>
+        `<div class="info-item"><span class="info-key">${k}:</span> <span class="info-val">${v ?? 'N/A'}</span></div>`
+    ).join('');
+    document.getElementById('archSection').style.display = 'block';
+}
+
+function displayKV(reader) {
+    const tbody = document.getElementById('kvBody');
+    document.getElementById('kvCount').textContent = reader.getKVCount().toLocaleString();
+
+    let html = '';
+    for (let i = 0; i < reader.getKVCount(); i++) {
+        const key = reader.getKVKey(i);
+        const type = reader.getKVType(i);
+
+        // For arrays, show count without loading all values into memory
+        let displayVal;
+        if (type === GGUFReader.KV_TYPES.ARRAY) {
+            const kv = reader._getKVAt(i);
+            const arrType = reader._view32.getUint32(kv.valueOffset, true);
+            const arrLen = Number(reader._readU64(kv.valueOffset + 4));
+            displayVal = `[${arrTypeName(arrType)}[${arrLen.toLocaleString()}]]`;
+        } else {
+            try {
+                const val = reader.getKVValue(i);
+                if (typeof val === 'string') {
+                    displayVal = val.length > 100 ? val.substring(0, 100) + '...' : val;
+                } else {
+                    displayVal = String(val);
+                }
+            } catch {
+                displayVal = '<parse error>';
+            }
+        }
+
+        html += `<tr><td>${i}</td><td title="${escapeHtml(key)}">${escapeHtml(key)}</td><td>${kvTypeName(type)}</td><td title="${escapeHtml(displayVal)}">${displayVal}</td></tr>`;
+    }
+    tbody.innerHTML = html;
+}
+
+function arrTypeName(type) {
+    const names = Object.entries(GGUFReader.KV_TYPES);
+    for (const [name, val] of names) {
+        if (val === type) return name.toLowerCase();
+    }
+    return `unknown(${type})`;
+}
+
+function displayTensors(reader) {
+    const tbody = document.getElementById('tensorBody');
+    document.getElementById('tensorCount').textContent = reader.getTensorCount().toLocaleString();
+
+    let html = '';
+    for (let i = 0; i < reader.getTensorCount(); i++) {
+        const name = reader.getTensorName(i);
+        const shape = reader.getTensorShape(i);
+        const type = reader.getTensorType(i);
+        const typeName = GGUFReader.tensorTypeName(type);
+        const meta = reader.getTensorMeta(i);
+
+        html += `<tr>
+            <td>${i}</td>
+            <td title="${escapeHtml(name)}">${escapeHtml(name)}</td>
+            <td class="shape-cell">[${shape.join(', ')}]</td>
+            <td><span class="type-badge type-${typeName}">${typeName}</span></td>
+            <td class="size-cell">${formatBytes(meta.nbytes)}</td>
+        </tr>`;
+    }
+    tbody.innerHTML = html;
+}
+
+function kvTypeName(type) {
+    const names = Object.entries(GGUFReader.KV_TYPES);
+    for (const [name, val] of names) {
+        if (val === type) return name;
+    }
+    return `UNKNOWN(${type})`;
+}
+
+function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+function escapeHtml(str) {
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+function showError(msg) {
+    errorMsg.textContent = msg;
+    errorMsg.style.display = 'block';
+}
+function hideError() {
+    errorMsg.style.display = 'none';
+}
+</script>
+</body>
+</html>
