@@ -260,15 +260,21 @@ function _q4kGetScaleMin(u8, scaleBase, sub) {
     return [s, m];
 }
 
-// Q3_K: extract 6-bit scale for sub-block j (0..15) from 12-byte scales array
-// Packing: lo4 in nibbles of bytes 0-7, hi2 packed 4-per-byte in bytes 8-11
-function _q3kGetScale(u8, scaleBase, j) {
-    const lo4 = (u8[scaleBase + (j >> 1)] >> ((j & 1) << 2)) & 0xF;
-    const hi2 = (u8[scaleBase + 8 + (j >> 2)] >> ((j & 3) << 1)) & 0x3;
-    return lo4 | (hi2 << 4);
+// Q3_K: extract 6-bit signed scale for sub-block sub (0..15) from 12-byte scales array
+// GGML layout (verified against dequantize_row_q3_K + aux[] manipulation):
+//   s[0..7]: one lower-4-bits per byte (sub<8 → lower nibble, sub>=8 → upper nibble of s[sub&7])
+//   s[8..11]: upper-2-bits packed 4-per-byte; byte = (sub&3)+8, shift = (sub>>2)*2
+function _q3kGetScale(u8, scaleBase, sub) {
+    // GGML: scales[sub] is 6-bit unsigned (0..63), dequant applies (scales[sub] - 32)
+    // s[0..7]: one lo4 per byte; byte = sub&7, nibble = (sub>>3)<<2
+    // s[8..11]: hi2 packed 4-per-byte; byte = (sub&3)+8, shift = (sub>>2)*2
+    const lo4 = (u8[scaleBase + (sub & 7)] >> ((sub >> 3) << 2)) & 0xF;
+    const hi2 = (u8[scaleBase + 8 + (sub & 3)] >> ((sub >> 2) * 2)) & 0x3;
+    return (lo4 | (hi2 << 4)) - 32;  // bias-32: maps 0..63 → -32..31
 }
 
 function matmulQ2KxF32(meta, input) {
+    // Block layout: scales[16]@0 qs[64]@16 d(f16)@80 dmin(f16)@82
     const inDim = meta.shape[0], outDim = meta.shape[1];
     const blocksPerCol = Math.ceil(inDim / QK_K);
     const u8 = new Uint8Array(meta.buffer);
@@ -279,16 +285,18 @@ function matmulQ2KxF32(meta, input) {
         let dot = 0;
         for (let b = 0; b < blocksPerCol; b++) {
             const bb = colBase + b * BLOCK_SIZE_Q2_K;
-            const d = dv.getFloat16(bb, true);
-            const dmin = dv.getFloat16(bb + 2, true);
+            const d    = dv.getFloat16(bb + 80, true);
+            const dmin = dv.getFloat16(bb + 82, true);
             const elemBase = b * QK_K;
             const maxElem = Math.min(QK_K, inDim - elemBase);
             for (let e = 0; e < maxElem; e++) {
-                const sub = e >> 4;
-                const scaleByte = u8[bb + 4 + sub];
-                const scale = scaleByte & 0xF;
-                const minVal = (scaleByte >> 4) & 0xF;
-                const q = (u8[bb + 20 + (e >> 2)] >> ((e & 3) << 1)) & 0x3;
+                const sub      = e >> 4;
+                const scaleByte = u8[bb + sub];           // scales @ 0
+                const scale    = scaleByte & 0xF;
+                const minVal   = (scaleByte >> 4) & 0xF;
+                // Q2_K qs: same interleaved layout as Q4_K — NOT a flat 2-bit array
+                const qb = bb + 16 + (e>>7)*32 + ((e>>4)&1)*16 + (e&15);
+                const q  = (u8[qb] >> (((e>>5)&3)*2)) & 0x3;
                 dot += input[elemBase + e] * (d * scale * q - dmin * minVal);
             }
         }
@@ -315,8 +323,11 @@ function matmulQ3KxF32(meta, input) {
             for (let e = 0; e < maxElem; e++) {
                 const sub = e >> 4;
                 const scale = _q3kGetScale(u8, bb + 96, sub);
-                const hmaskBit = (u8[bb + (e >> 3)] >> (e & 7)) & 1;
-                const low2 = (u8[bb + 32 + (e >> 2)] >> ((e & 3) << 1)) & 3;
+                // Q3_K hmask: each byte covers 8 groups; byte = l_half*16+l, bit = e>>5
+                const hmaskBit = (u8[bb + ((e>>4)&1)*16 + (e&15)] >> (e>>5)) & 1;
+                // Q3_K qs: same interleaved layout as Q2_K
+                const qb = bb + 32 + (e>>7)*32 + ((e>>4)&1)*16 + (e&15);
+                const low2 = (u8[qb] >> (((e>>5)&3)*2)) & 3;
                 const q3 = low2 | (hmaskBit << 2);
                 dot += input[elemBase + e] * (d * scale * (q3 - 4));
             }
@@ -343,10 +354,12 @@ function matmulQ4KxF32(meta, input) {
             const elemBase = b * QK_K;
             const maxElem = Math.min(QK_K, inDim - elemBase);
             for (let e = 0; e < maxElem; e++) {
-                const sub = e >> 5;  // 8 sub-blocks of 32 elements
+                // chunk=e>>6 (4 chunks of 64), lower half (e&63)<32 → sub even, upper half → sub odd
+                const sub = (e >> 6) * 2 + ((e >> 5) & 1);
                 const [sc, mn] = _q4kGetScaleMin(u8, bb + 4, sub);
-                const qsByte = u8[bb + 16 + (e >> 1)];
-                const q4 = e & 1 ? (qsByte >> 4) & 0xF : qsByte & 0xF;
+                // each 64-elem chunk uses 32 qs bytes; elements e and e+32 share the same byte
+                const qsByte = u8[bb + 16 + (e >> 6) * 32 + (e & 31)];
+                const q4 = ((e >> 5) & 1) ? (qsByte >> 4) & 0xF : qsByte & 0xF;
                 dot += input[elemBase + e] * (d * sc * q4 - dmin * mn);
             }
         }
@@ -372,11 +385,13 @@ function matmulQ5KxF32(meta, input) {
             const elemBase = b * QK_K;
             const maxElem = Math.min(QK_K, inDim - elemBase);
             for (let e = 0; e < maxElem; e++) {
-                const sub = e >> 5;
+                const sub = (e >> 6) * 2 + ((e >> 5) & 1);
                 const [sc, mn] = _q4kGetScaleMin(u8, bb + 4, sub);
-                const highBit = (u8[bb + 16 + (e >> 3)] >> (e & 7)) & 1;
-                const qsByte = u8[bb + 48 + (e >> 1)];
-                const low4 = e & 1 ? (qsByte >> 4) & 0xF : qsByte & 0xF;
+                // qh: 32 bytes, qh[e&31] bit = (e>>6)*2 + ((e>>5)&1)
+                const qhBit = (e >> 6) * 2 + ((e >> 5) & 1);
+                const highBit = (u8[bb + 16 + (e & 31)] >> qhBit) & 1;
+                const qsByte = u8[bb + 48 + (e >> 6) * 32 + (e & 31)];
+                const low4 = ((e >> 5) & 1) ? (qsByte >> 4) & 0xF : qsByte & 0xF;
                 const q5 = low4 | (highBit << 4);
                 dot += input[elemBase + e] * (d * sc * q5 - dmin * mn);
             }
@@ -402,13 +417,19 @@ function matmulQ6KxF32(meta, input) {
             const elemBase = b * QK_K;
             const maxElem = Math.min(QK_K, inDim - elemBase);
             for (let e = 0; e < maxElem; e++) {
-                const sub = e >> 4;  // 16 sub-blocks of 16 elements
-                const scaleByte = u8[bb + 192 + sub];
-                const scale = scaleByte >= 128 ? scaleByte - 256 : scaleByte;
-                const qlByte = u8[bb + (e >> 1)];
-                const low4 = e & 1 ? (qlByte >> 4) & 0xF : qlByte & 0xF;
-                const high2 = (u8[bb + 128 + (e >> 2)] >> ((e & 3) << 1)) & 0x3;
+                // Q6_K: two 128-element chunks (e>>7), 4-interleaved within each chunk
+                // ql layout: chunk*64 + (qgroup&1)*32 + l  where l=e&31, qgroup=(e>>5)&3
+                const qlByte = u8[bb + (e >> 7) * 64 + ((e >> 5) & 1) * 32 + (e & 31)];
+                // nibble: low for qgroups 0,1 (e&127 < 64), high for qgroups 2,3 (e&127 >= 64)
+                const low4 = ((e >> 6) & 1) ? (qlByte >> 4) & 0xF : qlByte & 0xF;
+                // qh: chunk*32 + l, shift = qgroup*2
+                const qhByte = u8[bb + 128 + (e >> 7) * 32 + (e & 31)];
+                const high2 = (qhByte >> (((e >> 5) & 3) * 2)) & 0x3;
                 const q6 = low4 | (high2 << 4);
+                // scale: chunk*8 + qgroup*2 + (l>>4)
+                const scaleIdx = (e >> 7) * 8 + ((e >> 5) & 3) * 2 + ((e & 31) >> 4);
+                const scaleByte = u8[bb + 192 + scaleIdx];
+                const scale = scaleByte >= 128 ? scaleByte - 256 : scaleByte;
                 dot += input[elemBase + e] * (d * scale * (q6 - 32));
             }
         }
@@ -500,6 +521,7 @@ function _lookupKQuantColumn(meta, colIdx) {
 }
 
 function _q2kColumn(meta, colIdx, outDim) {
+    // Block layout: scales[16]@0 qs[64]@16 d(f16)@80 dmin(f16)@82
     const blocksPerCol = Math.ceil(outDim / QK_K);
     const u8 = new Uint8Array(meta.buffer);
     const dv = new DataView(meta.buffer);
@@ -508,13 +530,14 @@ function _q2kColumn(meta, colIdx, outDim) {
     let outIdx = 0;
     for (let b = 0; b < blocksPerCol && outIdx < outDim; b++) {
         const bb = colBase + b * BLOCK_SIZE_Q2_K;
-        const d = dv.getFloat16(bb, true);
-        const dmin = dv.getFloat16(bb + 2, true);
+        const d    = dv.getFloat16(bb + 80, true);
+        const dmin = dv.getFloat16(bb + 82, true);
         const maxElem = Math.min(QK_K, outDim - outIdx);
         for (let e = 0; e < maxElem; e++, outIdx++) {
-            const sub = e >> 4;
-            const scaleByte = u8[bb + 4 + sub];
-            const q = (u8[bb + 20 + (e >> 2)] >> ((e & 3) << 1)) & 0x3;
+            const sub       = e >> 4;
+            const scaleByte = u8[bb + sub];                  // scales @ 0
+            const qb = bb + 16 + (e>>7)*32 + ((e>>4)&1)*16 + (e&15);
+            const q  = (u8[qb] >> (((e>>5)&3)*2)) & 0x3;
             out[outIdx] = d * (scaleByte & 0xF) * q - dmin * ((scaleByte >> 4) & 0xF);
         }
     }
@@ -535,8 +558,9 @@ function _q3kColumn(meta, colIdx, outDim) {
         const maxElem = Math.min(QK_K, outDim - outIdx);
         for (let e = 0; e < maxElem; e++, outIdx++) {
             const scale = _q3kGetScale(u8, bb + 96, e >> 4);
-            const hmaskBit = (u8[bb + (e >> 3)] >> (e & 7)) & 1;
-            const low2 = (u8[bb + 32 + (e >> 2)] >> ((e & 3) << 1)) & 3;
+            const hmaskBit = (u8[bb + ((e>>4)&1)*16 + (e&15)] >> (e>>5)) & 1;
+            const qb = bb + 32 + (e>>7)*32 + ((e>>4)&1)*16 + (e&15);
+            const low2 = (u8[qb] >> (((e>>5)&3)*2)) & 3;
             out[outIdx] = d * scale * ((low2 | (hmaskBit << 2)) - 4);
         }
     }
@@ -554,9 +578,10 @@ function _q4kColumn(meta, colIdx, outDim) {
         const d = dv.getFloat16(bb, true), dmin = dv.getFloat16(bb + 2, true);
         const maxElem = Math.min(QK_K, outDim - outIdx);
         for (let e = 0; e < maxElem; e++, outIdx++) {
-            const [sc, mn] = _q4kGetScaleMin(u8, bb + 4, e >> 5);
-            const qsByte = u8[bb + 16 + (e >> 1)];
-            const q4 = e & 1 ? (qsByte >> 4) & 0xF : qsByte & 0xF;
+            const sub = (e >> 6) * 2 + ((e >> 5) & 1);
+            const [sc, mn] = _q4kGetScaleMin(u8, bb + 4, sub);
+            const qsByte = u8[bb + 16 + (e >> 6) * 32 + (e & 31)];
+            const q4 = ((e >> 5) & 1) ? (qsByte >> 4) & 0xF : qsByte & 0xF;
             out[outIdx] = d * sc * q4 - dmin * mn;
         }
     }
@@ -574,10 +599,12 @@ function _q5kColumn(meta, colIdx, outDim) {
         const d = dv.getFloat16(bb, true), dmin = dv.getFloat16(bb + 2, true);
         const maxElem = Math.min(QK_K, outDim - outIdx);
         for (let e = 0; e < maxElem; e++, outIdx++) {
-            const [sc, mn] = _q4kGetScaleMin(u8, bb + 4, e >> 5);
-            const highBit = (u8[bb + 16 + (e >> 3)] >> (e & 7)) & 1;
-            const qsByte = u8[bb + 48 + (e >> 1)];
-            const low4 = e & 1 ? (qsByte >> 4) & 0xF : qsByte & 0xF;
+            const sub = (e >> 6) * 2 + ((e >> 5) & 1);
+            const [sc, mn] = _q4kGetScaleMin(u8, bb + 4, sub);
+            const qhBit = (e >> 6) * 2 + ((e >> 5) & 1);
+            const highBit = (u8[bb + 16 + (e & 31)] >> qhBit) & 1;
+            const qsByte = u8[bb + 48 + (e >> 6) * 32 + (e & 31)];
+            const low4 = ((e >> 5) & 1) ? (qsByte >> 4) & 0xF : qsByte & 0xF;
             out[outIdx] = d * sc * (low4 | (highBit << 4)) - dmin * mn;
         }
     }
@@ -595,10 +622,13 @@ function _q6kColumn(meta, colIdx, outDim) {
         const d = dv.getFloat16(bb + 208, true);
         const maxElem = Math.min(QK_K, outDim - outIdx);
         for (let e = 0; e < maxElem; e++, outIdx++) {
-            const scaleByte = u8[bb + 192 + (e >> 4)];
+            const qlByte = u8[bb + (e >> 7) * 64 + ((e >> 5) & 1) * 32 + (e & 31)];
+            const low4 = ((e >> 6) & 1) ? (qlByte >> 4) & 0xF : qlByte & 0xF;
+            const qhByte = u8[bb + 128 + (e >> 7) * 32 + (e & 31)];
+            const high2 = (qhByte >> (((e >> 5) & 3) * 2)) & 0x3;
+            const scaleIdx = (e >> 7) * 8 + ((e >> 5) & 3) * 2 + ((e & 31) >> 4);
+            const scaleByte = u8[bb + 192 + scaleIdx];
             const scale = scaleByte >= 128 ? scaleByte - 256 : scaleByte;
-            const low4 = e & 1 ? (u8[bb + (e >> 1)] >> 4) & 0xF : u8[bb + (e >> 1)] & 0xF;
-            const high2 = (u8[bb + 128 + (e >> 2)] >> ((e & 3) << 1)) & 0x3;
             out[outIdx] = d * scale * ((low4 | (high2 << 4)) - 32);
         }
     }

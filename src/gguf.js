@@ -234,6 +234,16 @@ class GGUFReader {
     // Returns tensor metadata WITHOUT copying data
     getTensorMeta(index) {
         const t = this._tensors[index];
+        if (t.tensorBuffer) {
+            // Loaded via fromFile(): each tensor has its own small buffer, offset is 0
+            return {
+                buffer: t.tensorBuffer,
+                offset: 0,
+                nbytes: t.nbytes,
+                shape: t.shape,
+                type: t.type
+            };
+        }
         return {
             buffer: this.buffer,
             offset: t.dataOffset,
@@ -321,4 +331,33 @@ class GGUFReader {
     // --- Q8_0 block constants for on-the-fly decode ---
     static QK_Q8_0 = 32;
     static BLOCK_SIZE_Q8_0 = 34; // sizeof(block_q8_0) = ggml_half d(2B) + qs[32](32B)
+
+    // --- Factory: load from File object (avoids Chrome ~2GB ArrayBuffer limit) ---
+    // Reads only the GGUF header section (always <10MB) to parse metadata,
+    // then loads each tensor's data as individual slices.
+    static async fromFile(file, onProgress) {
+        // 64MB is a very safe upper bound for GGUF header+metadata (typically <5MB)
+        const HEADER_MAX = 64 * 1024 * 1024;
+        const headerSlice = file.slice(0, Math.min(HEADER_MAX, file.size));
+        const headerBuf = await headerSlice.arrayBuffer();
+
+        // Parse header: this reads KV pairs and tensor metadata (all in header section)
+        // this.buffer = headerBuf, which is fine — _parseHeader() only touches header bytes
+        const reader = new GGUFReader(headerBuf);
+        reader._fileSize = file.size;
+
+        // Load each tensor's data as a separate slice — each is small enough to allocate
+        const n = reader._tensors.length;
+        let bytesLoaded = 0;
+        for (let i = 0; i < n; i++) {
+            const t = reader._tensors[i];
+            const end = Math.min(t.dataOffset + t.nbytes, file.size);
+            const slice = file.slice(t.dataOffset, end);
+            t.tensorBuffer = await slice.arrayBuffer();
+            bytesLoaded += t.tensorBuffer.byteLength;
+            if (onProgress) onProgress(bytesLoaded / file.size);
+        }
+
+        return reader;
+    }
 }

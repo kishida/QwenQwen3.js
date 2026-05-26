@@ -35,6 +35,11 @@ class Qwen3Engine {
         const outputTensor = gguf.getTensorMetaByName("output.weight");
         this.output = outputTensor || this.tokEmbd;
 
+        // Read MoE config from GGUF metadata (arch prefix = e.g. "qwen3moe")
+        const archName = gguf.getKeyValue('general.architecture', 'qwen3');
+        const nExperts     = Number(gguf.getKeyValue(`${archName}.expert_count`))      || 128;
+        const nExpertsUsed = Number(gguf.getKeyValue(`${archName}.expert_used_count`)) || 8;
+
         this.layers = new Array(this.nLayers);
         this.isMoE = false;
 
@@ -64,8 +69,8 @@ class Qwen3Engine {
                 ffnGateExps: gguf.getTensorMetaByName(`${p}.ffn_gate_exps.weight`),
                 ffnUpExps:   gguf.getTensorMetaByName(`${p}.ffn_up_exps.weight`),
                 ffnDownExps: gguf.getTensorMetaByName(`${p}.ffn_down_exps.weight`),
-                nExperts:    128,
-                nExpertsUsed: 8,
+                nExperts,
+                nExpertsUsed,
             };
         }
     }

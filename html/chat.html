@@ -58,7 +58,8 @@ body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
     <input type="file" id="fileInput" accept=".gguf">
     <div id="progressBar"><div id="progressFill"></div></div>
     <span id="modelStatus">モデル未読込</span>
-    <button class="btn" onclick="toggleSettings()" style="margin-left:auto;">⚙ 設定</button>
+    <button class="btn" id="resetBtn" onclick="resetChat()" style="margin-left:auto;" disabled>🗑 リセット</button>
+    <button class="btn" onclick="toggleSettings()">⚙ 設定</button>
 </div>
 
 <div id="settings">
@@ -104,18 +105,15 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
     statusEl.textContent = '読み込み中...';
     statusEl.className = '';
     progressBar.style.display = 'block';
-    progressFill.style.width = '10%';
-
-    await new Promise(r => setTimeout(r, 50));
-
-    const buffer = await file.arrayBuffer();
-    progressFill.style.width = '40%';
-    await new Promise(r => setTimeout(r, 50));
+    progressFill.style.width = '5%';
 
     try {
-        const gguf = new GGUFReader(buffer);
-        progressFill.style.width = '60%';
-        await new Promise(r => setTimeout(r, 50));
+        // GGUFReader.fromFile() reads only the small header first, then loads
+        // each tensor as a separate slice — avoids Chrome's ~2GB ArrayBuffer limit.
+        const gguf = await GGUFReader.fromFile(file, (progress) => {
+            progressFill.style.width = `${5 + progress * 88}%`;
+        });
+        progressFill.style.width = '93%';
 
         // Try GPU engine first, fall back to CPU
         let gpuLabel = '';
@@ -136,6 +134,7 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
 
         document.getElementById('messageInput').disabled = false;
         document.getElementById('sendBtn').disabled = false;
+        document.getElementById('resetBtn').disabled = false;
 
         setTimeout(() => { progressBar.style.display = 'none'; }, 500);
     } catch (err) {
@@ -290,6 +289,16 @@ async function sendMessage() {
 
     isGenerating = false;
     document.getElementById('stopBtn').style.display = 'none';
+}
+
+function resetChat() {
+    if (isGenerating) stopGeneration();
+    conversationHistory = [];
+    document.getElementById('chatContainer').innerHTML = '';
+    const statsBar = document.getElementById('statsBar');
+    statsBar.textContent = '';
+    statsBar.className = '';
+    if (engine && engine.resetKVCache) engine.resetKVCache();
 }
 
 document.addEventListener('keydown', (e) => {

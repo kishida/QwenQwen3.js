@@ -69,54 +69,76 @@ fn q4k_scale_min(scaleBase: u32, j: u32, sc: ptr<function,f32>, mn: ptr<function
     *sc = f32(s); *mn = f32(m);
 }
 
-// Q3_K 6-bit scale (j=0..15, 12-byte scales at scaleBase)
-fn q3k_scale(scaleBase: u32, j: u32) -> f32 {
-    let lo4 = (rb(scaleBase + (j >> 1u)) >> ((j & 1u) << 2u)) & 0xFu;
-    let hi2 = (rb(scaleBase + 8u + (j >> 2u)) >> ((j & 3u) << 1u)) & 0x3u;
-    return f32(lo4 | (hi2 << 4u));
+// Q3_K 6-bit signed scale (sub=0..15, 12-byte scales at scaleBase)
+// s[0..7]: one lo4 per byte; s[8..11]: hi2 packed 4-per-byte
+// byte(lo4)=(sub&7), shift(lo4)=(sub>>3)<<2; byte(hi2)=(sub&3)+8, shift(hi2)=(sub>>2)*2
+fn q3k_scale(scaleBase: u32, sub: u32) -> f32 {
+    // GGML: 6-bit unsigned (0..63), dequant applies (scale - 32) as bias subtraction
+    let lo4 = (rb(scaleBase + (sub & 7u)) >> ((sub >> 3u) << 2u)) & 0xFu;
+    let hi2 = (rb(scaleBase + 8u + (sub & 3u)) >> ((sub >> 2u) * 2u)) & 0x3u;
+    return f32(lo4 | (hi2 << 4u)) - 32.0;  // maps 0..63 → -32..31
 }
 
 fn dequant(bb: u32, e: u32) -> f32 {
     var result: f32 = 0.0;
     switch p.qtype {
-        case 10u: { // Q2_K: d(2) dmin(2) scales[16]@4 qs[64]@20
-            let d = rf16(bb); let dm = rf16(bb + 2u);
-            let sub = e >> 4u;
-            let sb = rb(bb + 4u + sub);
-            let q = (rb(bb + 20u + (e >> 2u)) >> ((e & 3u) << 1u)) & 3u;
+        case 10u: { // Q2_K: scales[16]@0 qs[64]@16 d(f16)@80 dmin(f16)@82
+            let d = rf16(bb + 80u); let dm = rf16(bb + 82u);
+            let sb = rb(bb + (e >> 4u));  // scales @ 0, index = e/16
+            // qs: same interleaved layout as Q4_K — NOT a flat 2-bit array
+            let qb = bb + 16u + (e >> 7u)*32u + ((e >> 4u) & 1u)*16u + (e & 15u);
+            let q = (rb(qb) >> (((e >> 5u) & 3u) * 2u)) & 3u;
             result = d * f32(sb & 0xFu) * f32(q) - dm * f32((sb >> 4u) & 0xFu);
         }
         case 11u: { // Q3_K: hmask[32]@0 qs[64]@32 scales[12]@96 d(2)@108
             let d = rf16(bb + 108u);
             let scale = q3k_scale(bb + 96u, e >> 4u);
-            let hb = (rb(bb + (e >> 3u)) >> (e & 7u)) & 1u;
-            let low2 = (rb(bb + 32u + (e >> 2u)) >> ((e & 3u) << 1u)) & 3u;
+            // hmask: each byte covers 8 groups; byte = l_half*16+l, bit = e>>5
+            let hb = (rb(bb + ((e >> 4u) & 1u)*16u + (e & 15u)) >> (e >> 5u)) & 1u;
+            // qs: same interleaved layout as Q2_K
+            let qb = bb + 32u + (e >> 7u)*32u + ((e >> 4u) & 1u)*16u + (e & 15u);
+            let low2 = (rb(qb) >> (((e >> 5u) & 3u) * 2u)) & 3u;
             result = d * scale * f32(i32(low2 | (hb << 2u)) - 4);
         }
         case 12u: { // Q4_K: d(2) dmin(2) scales[12]@4 qs[128]@16
+            // chunk=e>>6 (4 chunks of 64); lower half → even sub, upper half → odd sub
             let d = rf16(bb); let dm = rf16(bb + 2u);
             var sc: f32; var mn: f32;
-            q4k_scale_min(bb + 4u, e >> 5u, &sc, &mn);
-            let qb = rb(bb + 16u + (e >> 1u));
-            let q = select((qb >> 4u) & 0xFu, qb & 0xFu, (e & 1u) == 0u);
+            let sub = (e >> 6u) * 2u + ((e >> 5u) & 1u);
+            q4k_scale_min(bb + 4u, sub, &sc, &mn);
+            // each 64-elem chunk uses 32 qs bytes; e and e+32 share the same byte
+            let qb = rb(bb + 16u + (e >> 6u) * 32u + (e & 31u));
+            let q = select((qb >> 4u) & 0xFu, qb & 0xFu, ((e >> 5u) & 1u) == 0u);
             result = d * sc * f32(q) - dm * mn;
         }
         case 13u: { // Q5_K: d(2) dmin(2) scales[12]@4 qh[32]@16 qs[128]@48
             let d = rf16(bb); let dm = rf16(bb + 2u);
             var sc: f32; var mn: f32;
-            q4k_scale_min(bb + 4u, e >> 5u, &sc, &mn);
-            let hb = (rb(bb + 16u + (e >> 3u)) >> (e & 7u)) & 1u;
-            let qb = rb(bb + 48u + (e >> 1u));
-            let low4 = select((qb >> 4u) & 0xFu, qb & 0xFu, (e & 1u) == 0u);
+            let sub = (e >> 6u) * 2u + ((e >> 5u) & 1u);
+            q4k_scale_min(bb + 4u, sub, &sc, &mn);
+            // qh: 32 bytes, byte=e&31, bit=(e>>6)*2+((e>>5)&1)
+            let qh_bit = (e >> 6u) * 2u + ((e >> 5u) & 1u);
+            let hb = (rb(bb + 16u + (e & 31u)) >> qh_bit) & 1u;
+            let qb = rb(bb + 48u + (e >> 6u) * 32u + (e & 31u));
+            let low4 = select((qb >> 4u) & 0xFu, qb & 0xFu, ((e >> 5u) & 1u) == 0u);
             result = d * sc * f32(low4 | (hb << 4u)) - dm * mn;
         }
         case 14u: { // Q6_K: ql[128]@0 qh[64]@128 scales[16]@192 d(2)@208
+            // two 128-elem chunks (e>>7), 4-interleaved within each chunk
             let d = rf16(bb + 208u);
-            let scaleByte = rb(bb + 192u + (e >> 4u));
+            // ql: chunk*64 + (qgroup&1)*32 + l   where l=e&31, qgroup=(e>>5)&3
+            let ql_idx = (e >> 7u) * 64u + ((e >> 5u) & 1u) * 32u + (e & 31u);
+            let qlb = rb(bb + ql_idx);
+            // nibble: low for qgroups 0,1 (e&127 < 64), high for 2,3
+            let low4 = select((qlb >> 4u) & 0xFu, qlb & 0xFu, ((e >> 6u) & 1u) == 0u);
+            // qh: chunk*32 + l, shift = qgroup*2
+            let qh_idx = (e >> 7u) * 32u + (e & 31u);
+            let qh_shift = ((e >> 5u) & 3u) * 2u;
+            let high2 = (rb(bb + 128u + qh_idx) >> qh_shift) & 3u;
+            // scale: chunk*8 + qgroup*2 + (l>>4)
+            let sc_idx = (e >> 7u) * 8u + ((e >> 5u) & 3u) * 2u + ((e & 31u) >> 4u);
+            let scaleByte = rb(bb + 192u + sc_idx);
             let sc = f32(bitcast<i32>(scaleByte << 24u) >> 24u);
-            let qlb = rb(bb + (e >> 1u));
-            let low4 = select((qlb >> 4u) & 0xFu, qlb & 0xFu, (e & 1u) == 0u);
-            let high2 = (rb(bb + 128u + (e >> 2u)) >> ((e & 3u) << 1u)) & 3u;
             result = d * sc * f32(i32(low4 | (high2 << 4u)) - 32);
         }
         default: { result = 0.0; }
@@ -469,6 +491,8 @@ class Qwen3GPUEngine {
         eng.maxCtx    = eng._cpu.maxCtx;
         eng.kvCache   = eng._cpu.kvCache;
         eng.tokenizer = eng._cpu.tokenizer;
+        eng.isMoE     = eng._cpu.isMoE;
+        eng.layers    = eng._cpu.layers;  // needed for nExperts, nExpertsUsed per layer
 
         // Create pipelines (async — surfaces WGSL compile errors with line numbers)
         console.log('[GPU] Compiling shaders...');
