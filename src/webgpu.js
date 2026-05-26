@@ -16,7 +16,8 @@ fn rb(byteOff: u32) -> u32 {
     return (weight[byteOff >> 2u] >> ((byteOff & 3u) << 3u)) & 0xFFu;
 }
 fn rf16(byteOff: u32) -> f32 {
-    return unpackHalf2x16(rb(byteOff) | (rb(byteOff+1u) << 8u)).x;
+    // unpack2x16float: lower 16 bits -> .x, upper 16 bits -> .y
+    return unpack2x16float(rb(byteOff) | (rb(byteOff + 1u) << 8u)).x;
 }
 
 @compute @workgroup_size(256)
@@ -34,7 +35,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var bd: f32 = 0.0;
         for (var i = 0u; i < maxI; i++) {
             let qb = rb(bb + 2u + i);
-            let q = f32(bitcast<i32>(qb << 24u) >> 24);
+            // sign-extend u8 -> i32: shift to MSB, arithmetic right shift back
+            let q = f32(bitcast<i32>(qb << 24u) >> 24u);
             bd += in_vec[eb + i] * q;
         }
         dot += bd * d;
@@ -50,8 +52,8 @@ struct Params { inDim: u32, outDim: u32, qtype: u32, blockBytes: u32 }
 @group(0) @binding(3) var<uniform> p: Params;
 
 fn rb(o: u32) -> u32 { return (weight[o >> 2u] >> ((o & 3u) << 3u)) & 0xFFu; }
-fn rf16(o: u32) -> f32 { return unpackHalf2x16(rb(o) | (rb(o+1u) << 8u)).x; }
-fn ri8(o: u32) -> f32 { return f32(bitcast<i32>(rb(o) << 24u) >> 24); }
+fn rf16(o: u32) -> f32 { return unpack2x16float(rb(o) | (rb(o + 1u) << 8u)).x; }
+fn ri8(o: u32) -> f32 { return f32(bitcast<i32>(rb(o) << 24u) >> 24u); }
 
 // Q4_K/Q5_K scale+min (j=0..7, 12-byte scales at scaleBase)
 fn q4k_scale_min(scaleBase: u32, j: u32, sc: ptr<function,f32>, mn: ptr<function,f32>) {
@@ -75,49 +77,51 @@ fn q3k_scale(scaleBase: u32, j: u32) -> f32 {
 }
 
 fn dequant(bb: u32, e: u32) -> f32 {
+    var result: f32 = 0.0;
     switch p.qtype {
         case 10u: { // Q2_K: d(2) dmin(2) scales[16]@4 qs[64]@20
-            let d = rf16(bb); let dm = rf16(bb+2u);
+            let d = rf16(bb); let dm = rf16(bb + 2u);
             let sub = e >> 4u;
             let sb = rb(bb + 4u + sub);
             let q = (rb(bb + 20u + (e >> 2u)) >> ((e & 3u) << 1u)) & 3u;
-            return d * f32(sb & 0xFu) * f32(q) - dm * f32((sb >> 4u) & 0xFu);
+            result = d * f32(sb & 0xFu) * f32(q) - dm * f32((sb >> 4u) & 0xFu);
         }
         case 11u: { // Q3_K: hmask[32]@0 qs[64]@32 scales[12]@96 d(2)@108
             let d = rf16(bb + 108u);
             let scale = q3k_scale(bb + 96u, e >> 4u);
             let hb = (rb(bb + (e >> 3u)) >> (e & 7u)) & 1u;
             let low2 = (rb(bb + 32u + (e >> 2u)) >> ((e & 3u) << 1u)) & 3u;
-            return d * scale * f32(i32(low2 | (hb << 2u)) - 4);
+            result = d * scale * f32(i32(low2 | (hb << 2u)) - 4);
         }
         case 12u: { // Q4_K: d(2) dmin(2) scales[12]@4 qs[128]@16
-            let d = rf16(bb); let dm = rf16(bb+2u);
+            let d = rf16(bb); let dm = rf16(bb + 2u);
             var sc: f32; var mn: f32;
             q4k_scale_min(bb + 4u, e >> 5u, &sc, &mn);
             let qb = rb(bb + 16u + (e >> 1u));
             let q = select((qb >> 4u) & 0xFu, qb & 0xFu, (e & 1u) == 0u);
-            return d * sc * f32(q) - dm * mn;
+            result = d * sc * f32(q) - dm * mn;
         }
         case 13u: { // Q5_K: d(2) dmin(2) scales[12]@4 qh[32]@16 qs[128]@48
-            let d = rf16(bb); let dm = rf16(bb+2u);
+            let d = rf16(bb); let dm = rf16(bb + 2u);
             var sc: f32; var mn: f32;
             q4k_scale_min(bb + 4u, e >> 5u, &sc, &mn);
             let hb = (rb(bb + 16u + (e >> 3u)) >> (e & 7u)) & 1u;
             let qb = rb(bb + 48u + (e >> 1u));
             let low4 = select((qb >> 4u) & 0xFu, qb & 0xFu, (e & 1u) == 0u);
-            return d * sc * f32(low4 | (hb << 4u)) - dm * mn;
+            result = d * sc * f32(low4 | (hb << 4u)) - dm * mn;
         }
         case 14u: { // Q6_K: ql[128]@0 qh[64]@128 scales[16]@192 d(2)@208
             let d = rf16(bb + 208u);
             let scaleByte = rb(bb + 192u + (e >> 4u));
-            let sc = f32(bitcast<i32>(scaleByte << 24u) >> 24);
+            let sc = f32(bitcast<i32>(scaleByte << 24u) >> 24u);
             let qlb = rb(bb + (e >> 1u));
             let low4 = select((qlb >> 4u) & 0xFu, qlb & 0xFu, (e & 1u) == 0u);
             let high2 = (rb(bb + 128u + (e >> 2u)) >> ((e & 3u) << 1u)) & 3u;
-            return d * sc * f32(i32(low4 | (high2 << 4u)) - 32);
+            result = d * sc * f32(i32(low4 | (high2 << 4u)) - 32);
         }
-        default: { return 0.0; }
+        default: { result = 0.0; }
     }
+    return result;
 }
 
 @compute @workgroup_size(256)
@@ -158,7 +162,7 @@ fn main(
     for (var i = li; i < hd; i += 256u) { let x = data[off + i]; s += x * x; }
     wg[li] = s;
     workgroupBarrier();
-    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+    for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
         if (li < stride) { wg[li] += wg[li + stride]; }
         workgroupBarrier();
     }
@@ -317,10 +321,19 @@ class GPUDevice {
         return data;
     }
 
-    getOrCreatePipeline(label, wgsl, entryPoint = 'main') {
+    async getOrCreatePipeline(label, wgsl, entryPoint = 'main') {
         const key = `${label}:${entryPoint}`;
         if (this._pipelineCache.has(key)) return this._pipelineCache.get(key);
         const module = this.device.createShaderModule({ label, code: wgsl });
+        // Surface line-level compile errors before the GPU error event fires
+        const info = await module.getCompilationInfo();
+        let hasError = false;
+        for (const msg of info.messages) {
+            const prefix = `[WGSL:${label}] line ${msg.lineNum}:${msg.linePos}`;
+            if (msg.type === 'error') { console.error(prefix, msg.message); hasError = true; }
+            else if (msg.type === 'warning') { console.warn(prefix, msg.message); }
+        }
+        if (hasError) throw new Error(`Shader compilation failed: ${label}`);
         const pipeline = this.device.createComputePipeline({
             label,
             layout: 'auto',
@@ -378,16 +391,19 @@ class Qwen3GPUEngine {
         eng.kvCache   = eng._cpu.kvCache;
         eng.tokenizer = eng._cpu.tokenizer;
 
-        // Create pipelines
-        eng._pipelines = {
-            matmulQ80:  eng._gpu.getOrCreatePipeline('matmul_q8_0', WGSL_MATMUL_Q8_0),
-            matmulKQ:   eng._gpu.getOrCreatePipeline('matmul_kquant', WGSL_MATMUL_KQUANT),
-            rmsnorm:    eng._gpu.getOrCreatePipeline('rmsnorm', WGSL_RMSNORM),
-            rope:       eng._gpu.getOrCreatePipeline('rope', WGSL_ROPE),
-            siluMul:    eng._gpu.getOrCreatePipeline('silu_mul', WGSL_ELEMENTWISE, 'silu_mul'),
-            addResidual:eng._gpu.getOrCreatePipeline('add_residual', WGSL_ELEMENTWISE, 'add_residual'),
-            copy:       eng._gpu.getOrCreatePipeline('copy', WGSL_COPY),
-        };
+        // Create pipelines (async — surfaces WGSL compile errors with line numbers)
+        console.log('[GPU] Compiling shaders...');
+        const [matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy] = await Promise.all([
+            eng._gpu.getOrCreatePipeline('matmul_q8_0',  WGSL_MATMUL_Q8_0),
+            eng._gpu.getOrCreatePipeline('matmul_kquant', WGSL_MATMUL_KQUANT),
+            eng._gpu.getOrCreatePipeline('rmsnorm',       WGSL_RMSNORM),
+            eng._gpu.getOrCreatePipeline('rope',          WGSL_ROPE),
+            eng._gpu.getOrCreatePipeline('silu_mul',      WGSL_ELEMENTWISE, 'silu_mul'),
+            eng._gpu.getOrCreatePipeline('add_residual',  WGSL_ELEMENTWISE, 'add_residual'),
+            eng._gpu.getOrCreatePipeline('copy',          WGSL_COPY),
+        ]);
+        eng._pipelines = { matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy };
+        console.log('[GPU] Shaders compiled OK.');
 
         // Upload weight tensors to GPU
         console.log('[GPU] Uploading weights...');
@@ -496,9 +512,6 @@ class Qwen3GPUEngine {
         const g = this._gpu;
         const hd = headDim ?? totalN;
         const nHeads = totalN / hd;
-        const uBuf = g.createUniformBuffer(new Float32Array([
-            ...new Uint32Array([hd]).buffer ? [] : [],  // need mixed types
-        ]));
         // Pack Params: headDim(u32) + eps(f32) = 8 bytes
         const params = new ArrayBuffer(8);
         new Uint32Array(params)[0] = hd;
@@ -604,12 +617,13 @@ class Qwen3GPUEngine {
                 g.readF32(this._buf.v, this.nKV),
             ]);
 
-            // --- KV cache + attention on CPU ---
+            // --- KV cache + attention core on CPU (QK softmax + weighted V, no wo projection) ---
             this.kvCache.store(l, position, kCPU, vCPU);
-            const attnOut = this._selfAttentionCPU(l, position, qCPU);
+            const attnCoreOut = this._selfAttentionCPU(l, position, qCPU);
 
-            // --- Upload attention output → output projection ---
-            g.device.queue.writeBuffer(this._buf.attnOut, 0, attnOut);
+            // --- Upload attention output → GPU wo projection ---
+            // attnCoreOut is bufAttnOut (size nQ = nHeads*headDimQ)
+            g.device.queue.writeBuffer(this._buf.attnOut, 0, attnCoreOut);
             this._matmul(gl.wo, this._buf.attnOut, this._buf.proj, cl.wo, this.nEmb);
 
             // --- Residual: hidden += proj ---
@@ -762,11 +776,12 @@ class Qwen3GPUEngine {
         uBuf.destroy();
     }
 
-    // ---- CPU attention (same as Qwen3Engine._selfAttention) ----
+    // ---- CPU attention core (QK softmax + weighted V, no wo projection) ----
+    // Returns cpu.bufAttnOut (Float32Array, size nQ = nHeads*headDimQ)
     _selfAttentionCPU(layerIdx, position, qData) {
         const cpu = this._cpu;
         cpu.bufQ.set(qData);
-        return cpu._selfAttention(layerIdx, position, cpu.layers[layerIdx].wo);
+        return cpu._selfAttentionCore(layerIdx, position);  // returns bufAttnOut, no wo
     }
 
     // ============================================================

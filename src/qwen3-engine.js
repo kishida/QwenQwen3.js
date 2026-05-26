@@ -239,13 +239,13 @@ class Qwen3Engine {
         return skipLogits ? null : this.bufLogits;
     }
 
-    // --- Self-attention with GQA ---
-    _selfAttention(layer, position, woMeta) {
+    // --- Self-attention core (GQA): QK^T + softmax + weighted V sum → bufAttnOut ---
+    // Does NOT apply the wo output projection. Call _selfAttention for the full pipeline.
+    _selfAttentionCore(layerIdx, position) {
         const nHeads = this.nHeads;
         const nHeadKV = this.nHeadKV;
         const headDimQ = this.headDimQ;
         const headDimKV = this.headDimKV;
-        // Use Q head dim for scaling (standard practice)
         const scale = 1.0 / Math.sqrt(headDimQ);
         const seqLen = position + 1;
         const scores = this.bufAttnScores;
@@ -256,21 +256,19 @@ class Qwen3Engine {
             const qOff = h * headDimQ;
             const scoreOff = h * seqLen;
 
-            // Dot with cached K tokens [0..position]
             for (let p = 0; p < seqLen; p++) {
                 let dot = 0;
-                const kSlice = this.kvCache.getK(layer, kvHead, p, p + 1);
+                const kSlice = this.kvCache.getK(layerIdx, kvHead, p, p + 1);
                 for (let d = 0; d < headDimKV; d++) {
                     dot += this.bufQ[qOff + d] * kSlice[d];
                 }
                 scores[scoreOff + p] = dot * scale;
             }
 
-            // Softmax over sequence dimension
             softmaxInPlace(scores, scoreOff, scoreOff + seqLen);
         }
 
-        // Weighted sum of V → bufAttnOut[nHeads * headDimQ]
+        // Weighted sum of V → bufAttnOut
         this.bufAttnOut.fill(0);
         for (let h = 0; h < nHeads; h++) {
             const kvHead = (h * nHeadKV) / nHeads | 0;
@@ -280,13 +278,18 @@ class Qwen3Engine {
             for (let p = 0; p < seqLen; p++) {
                 const w = scores[scoreOff + p];
                 if (w === 0) continue;
-                const vSlice = this.kvCache.getV(layer, kvHead, p, p + 1);
+                const vSlice = this.kvCache.getV(layerIdx, kvHead, p, p + 1);
                 for (let d = 0; d < headDimKV; d++) {
                     this.bufAttnOut[outOff + d] += vSlice[d] * w;
                 }
             }
         }
+        return this.bufAttnOut;
+    }
 
+    // --- Self-attention with GQA (includes wo output projection) ---
+    _selfAttention(layer, position, woMeta) {
+        this._selfAttentionCore(layer, position);
         // Output projection: wo @ bufAttnOut → n_embd result
         const projResult = matmulGeneric(woMeta, this.bufAttnOut);
         return projResult;
