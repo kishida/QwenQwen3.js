@@ -180,25 +180,33 @@ class BPETokenizer {
     }
 
     decode(tokenIds) {
-        const decoder = new TextDecoder('utf-8');
-        let out = '';
+        const allBytes = [];
         for (const id of tokenIds) {
             if (typeof id === 'string') {
-                const cp = id.codePointAt(0);
                 const b = _gpt2CharToByte.get(id);
                 if (b !== undefined) {
-                    out += decoder.decode(new Uint8Array([b]));
+                    allBytes.push(b);
                 } else {
-                    out += id;
+                    const utf8 = new TextEncoder().encode(id);
+                    for (const byte of utf8) allBytes.push(byte);
                 }
             } else {
                 const tok = this.idToToken[id];
                 if (tok != null) {
-                    out += gpt2Decode(tok);
+                    for (let i = 0; i < tok.length; i++) {
+                        const b = _gpt2CharToByte.get(tok[i]);
+                        if (b !== undefined) {
+                            allBytes.push(b);
+                        } else {
+                            const utf8 = new TextEncoder().encode(tok[i]);
+                            for (const byte of utf8) allBytes.push(byte);
+                        }
+                    }
                 }
             }
         }
-        return out.replace(/\u2581/g, ' ');
+        return new TextDecoder('utf-8').decode(new Uint8Array(allBytes))
+            .replace(/\u2581/g, ' ');
     }
 
     get vocabSize() { return this.idToToken.length; }
