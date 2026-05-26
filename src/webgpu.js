@@ -223,6 +223,85 @@ fn axpy(@builtin(global_invocation_id) gid: vec3<u32>) {
     a[i] += b[i];  // scale passed via b being pre-scaled on CPU
 }`;
 
+// GQA decode attention — one workgroup per query head
+// Workgroup memory: scores[2048] + reduce[256] ≈ 9 KB (within 16 KB limit)
+const WGSL_ATTENTION = /* wgsl */`
+struct AttnP {
+    nHeads: u32, nHeadKV: u32,
+    headDimQ: u32, headDimKV: u32,
+    seqLen: u32, maxCtx: u32,
+    scale: f32, _pad: u32,
+}
+@group(0) @binding(0) var<storage, read>       q:       array<f32>; // [nHeads * headDimQ]
+@group(0) @binding(1) var<storage, read>       k_cache: array<f32>; // [maxCtx * nHeadKV * headDimKV]
+@group(0) @binding(2) var<storage, read>       v_cache: array<f32>; // [maxCtx * nHeadKV * headDimKV]
+@group(0) @binding(3) var<storage, read_write> out:     array<f32>; // [nHeads * headDimKV]
+@group(0) @binding(4) var<uniform>             p:       AttnP;
+
+var<workgroup> scores: array<f32, 2048>; // max seqLen supported
+var<workgroup> reduce: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h  = wid.x;
+    let li = lid.x;
+    let kvHead  = (h * p.nHeadKV) / p.nHeads;
+    let seqLen  = min(p.seqLen, 2048u);
+    let qOff    = h * p.headDimQ;
+    let kvStride = p.nHeadKV * p.headDimKV;
+
+    // Step 1: QK^T scores
+    for (var t = li; t < seqLen; t += 256u) {
+        let kOff = t * kvStride + kvHead * p.headDimKV;
+        var dot: f32 = 0.0;
+        for (var d = 0u; d < p.headDimKV; d++) {
+            dot += q[qOff + d] * k_cache[kOff + d];
+        }
+        scores[t] = dot * p.scale;
+    }
+    workgroupBarrier();
+
+    // Step 2: find max
+    var lmax: f32 = -1e30;
+    for (var t = li; t < seqLen; t += 256u) { lmax = max(lmax, scores[t]); }
+    reduce[li] = lmax;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (li < s) { reduce[li] = max(reduce[li], reduce[li + s]); }
+        workgroupBarrier();
+    }
+    let gmax = reduce[0];
+
+    // Step 3: exp + sum
+    var lsum: f32 = 0.0;
+    for (var t = li; t < seqLen; t += 256u) {
+        let e = exp(scores[t] - gmax);
+        scores[t] = e;
+        lsum += e;
+    }
+    reduce[li] = lsum;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (li < s) { reduce[li] += reduce[li + s]; }
+        workgroupBarrier();
+    }
+    let inv_sum = 1.0 / reduce[0];
+
+    // Step 4: normalize
+    for (var t = li; t < seqLen; t += 256u) { scores[t] *= inv_sum; }
+    workgroupBarrier();
+
+    // Step 5: weighted V sum → output
+    let outOff = h * p.headDimKV;
+    for (var d = li; d < p.headDimKV; d += 256u) {
+        var acc: f32 = 0.0;
+        for (var t = 0u; t < seqLen; t++) {
+            acc += scores[t] * v_cache[t * kvStride + kvHead * p.headDimKV + d];
+        }
+        out[outOff + d] = acc;
+    }
+}`;
+
 const WGSL_COPY = /* wgsl */`
 @group(0) @binding(0) var<storage, read> src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
@@ -393,7 +472,7 @@ class Qwen3GPUEngine {
 
         // Create pipelines (async — surfaces WGSL compile errors with line numbers)
         console.log('[GPU] Compiling shaders...');
-        const [matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy] = await Promise.all([
+        const [matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy, attention] = await Promise.all([
             eng._gpu.getOrCreatePipeline('matmul_q8_0',  WGSL_MATMUL_Q8_0),
             eng._gpu.getOrCreatePipeline('matmul_kquant', WGSL_MATMUL_KQUANT),
             eng._gpu.getOrCreatePipeline('rmsnorm',       WGSL_RMSNORM),
@@ -401,8 +480,9 @@ class Qwen3GPUEngine {
             eng._gpu.getOrCreatePipeline('silu_mul',      WGSL_ELEMENTWISE, 'silu_mul'),
             eng._gpu.getOrCreatePipeline('add_residual',  WGSL_ELEMENTWISE, 'add_residual'),
             eng._gpu.getOrCreatePipeline('copy',          WGSL_COPY),
+            eng._gpu.getOrCreatePipeline('attention',     WGSL_ATTENTION),
         ]);
-        eng._pipelines = { matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy };
+        eng._pipelines = { matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy, attention };
         console.log('[GPU] Shaders compiled OK.');
 
         // Upload weight tensors to GPU
@@ -412,6 +492,10 @@ class Qwen3GPUEngine {
 
         // Allocate working GPU buffers
         eng._allocGPUBuffers();
+
+        // Allocate GPU-side KV cache (replaces CPU KV cache for attention)
+        eng._gpuMaxCtx = Math.min(eng._cpu.maxCtx, 2048);
+        eng._allocGPUKVCache();
 
         return eng;
     }
@@ -479,6 +563,21 @@ class Qwen3GPUEngine {
             moeAcc:    f32(this.nEmb),
             logits:    f32(this.nVocab),
         };
+    }
+
+    _allocGPUKVCache() {
+        const g = this._gpu;
+        // Per-layer GPU KV cache: [gpuMaxCtx * nHeadKV * headDimKV] f32 values = kvBytes bytes
+        const floatCount = this._gpuMaxCtx * this.nHeadKV * this.headDimKV;
+        const kvBytes    = floatCount * 4;
+        this._kvCacheK = [];
+        this._kvCacheV = [];
+        for (let l = 0; l < this.nLayers; l++) {
+            this._kvCacheK.push(g.createBuffer(kvBytes));  // createBuffer takes bytes
+            this._kvCacheV.push(g.createBuffer(kvBytes));
+        }
+        const totalMB = (this.nLayers * 2 * kvBytes / 1024 / 1024).toFixed(0);
+        console.log(`[GPU] KV cache: ${this.nLayers}L × 2 × ${(kvBytes/1024).toFixed(0)} KB = ${totalMB} MB`);
     }
 
     // ---- GPU helper: dispatch matmul (handles Q8_0 and k-quants) ----
@@ -565,21 +664,52 @@ class Qwen3GPUEngine {
         this._gpu.device.queue.submit([enc.finish()]);
     }
 
-    // ---- GPU helper: norm weight buffer (F32, small → re-upload each call or cache) ----
-    _getF32WeightBuf(meta) {
-        // These are small (n_embd = 2048 floats = 8KB), upload on demand
-        const slice = new Uint8Array(meta.buffer, meta.offset, meta.nbytes);
-        return this._gpu.uploadBuffer(slice);
+    // ---- Store current K/V buffers into GPU KV cache at given position ----
+    _storeKVGPU(layerIdx, position) {
+        if (position >= this._gpuMaxCtx) return;  // silently ignore beyond GPU max ctx
+        const byteOffset = position * this.nHeadKV * this.headDimKV * 4;  // bytes
+        const byteSize   = this.nHeadKV * this.headDimKV * 4;              // bytes
+        const enc = this._gpu.device.createCommandEncoder();
+        enc.copyBufferToBuffer(this._buf.k, 0, this._kvCacheK[layerIdx], byteOffset, byteSize);
+        enc.copyBufferToBuffer(this._buf.v, 0, this._kvCacheV[layerIdx], byteOffset, byteSize);
+        this._gpu.device.queue.submit([enc.finish()]);
+    }
+
+    // ---- GPU GQA attention using GPU KV cache, output → _buf.attnOut ----
+    _attentionGPU(layerIdx, position) {
+        const g = this._gpu;
+        const seqLen = position + 1;
+        const scale  = 1.0 / Math.sqrt(this.headDimKV);
+
+        const params = new ArrayBuffer(32);  // 8 × 4 bytes
+        const u32 = new Uint32Array(params);
+        const f32 = new Float32Array(params);
+        u32[0] = this.nHeads;    u32[1] = this.nHeadKV;
+        u32[2] = this.headDimQ;  u32[3] = this.headDimKV;
+        u32[4] = seqLen;         u32[5] = this._gpuMaxCtx;
+        f32[6] = scale;          u32[7] = 0;  // padding
+
+        const pBuf = g.createUniformBuffer(params);
+        g.dispatch(this._pipelines.attention, [
+            g.buf(this._buf.q),
+            g.buf(this._kvCacheK[layerIdx]),
+            g.buf(this._kvCacheV[layerIdx]),
+            g.buf(this._buf.attnOut),
+            g.ubuf(pBuf),
+        ], this.nHeads);  // one workgroup per Q head
+        pBuf.destroy();
     }
 
     // ============================================================
-    //  Forward pass (one token)
+    //  Forward pass (one token) — fully on GPU
+    //  Only GPU→CPU sync: 1× logits readback (when !skipLogits)
+    //  Only CPU→GPU upload: 1× embedding per token
     // ============================================================
     async forward(tokenId, position, skipLogits = false) {
         const g = this._gpu;
         const cpu = this._cpu;
 
-        // 1. Embedding lookup on CPU → upload to hiddenBuf
+        // 1. Embedding lookup on CPU → GPU hidden state
         const emb = embeddingLookupGeneric(cpu.tokEmbd, tokenId);
         g.device.queue.writeBuffer(this._buf.hidden, 0, emb);
 
@@ -587,11 +717,9 @@ class Qwen3GPUEngine {
             const gl = this._gpuW.layers[l];
             const cl = cpu.layers[l];
 
-            // --- Attention norm ---
+            // --- Attention norm (pre-cached F32 buffer, no alloc/free) ---
             this._copy(this._buf.hidden, this._buf.normed, this.nEmb);
-            const attnNormF32Buf = this._getF32WeightBuf(cl.attnNorm);
-            this._rmsnorm(this._buf.normed, attnNormF32Buf, this.nEmb);
-            attnNormF32Buf.destroy();
+            this._rmsnorm(this._buf.normed, gl.attnNorm, this.nEmb);
 
             // --- Q / K / V projections ---
             this._matmul(gl.wq, this._buf.normed, this._buf.q, cl.wq, this.nQ);
@@ -599,47 +727,33 @@ class Qwen3GPUEngine {
             this._matmul(gl.wv, this._buf.normed, this._buf.v, cl.wv, this.nKV);
 
             // --- Per-head RMSNorm on Q and K ---
-            const qNormF32Buf = this._getF32WeightBuf(cl.qNorm);
-            const kNormF32Buf = this._getF32WeightBuf(cl.kNorm);
-            this._rmsnorm(this._buf.q, qNormF32Buf, this.nQ, this.headDimQ);
-            this._rmsnorm(this._buf.k, kNormF32Buf, this.nKV, this.headDimKV);
-            qNormF32Buf.destroy();
-            kNormF32Buf.destroy();
+            this._rmsnorm(this._buf.q, gl.qNorm, this.nQ,  this.headDimQ);
+            this._rmsnorm(this._buf.k, gl.kNorm, this.nKV, this.headDimKV);
 
             // --- RoPE ---
-            this._rope(this._buf.q, this.nHeads, this.headDimQ, position);
+            this._rope(this._buf.q, this.nHeads,  this.headDimQ,  position);
             this._rope(this._buf.k, this.nHeadKV, this.headDimKV, position);
 
-            // --- Read back Q, K, V for CPU attention ---
-            const [qCPU, kCPU, vCPU] = await Promise.all([
-                g.readF32(this._buf.q, this.nQ),
-                g.readF32(this._buf.k, this.nKV),
-                g.readF32(this._buf.v, this.nKV),
-            ]);
+            // --- Store K/V into GPU KV cache (GPU→GPU copy, no CPU roundtrip) ---
+            this._storeKVGPU(l, position);
 
-            // --- KV cache + attention core on CPU (QK softmax + weighted V, no wo projection) ---
-            this.kvCache.store(l, position, kCPU, vCPU);
-            const attnCoreOut = this._selfAttentionCPU(l, position, qCPU);
+            // --- GPU attention (GQA) → _buf.attnOut ---
+            this._attentionGPU(l, position);
 
-            // --- Upload attention output → GPU wo projection ---
-            // attnCoreOut is bufAttnOut (size nQ = nHeads*headDimQ)
-            g.device.queue.writeBuffer(this._buf.attnOut, 0, attnCoreOut);
+            // --- Output projection ---
             this._matmul(gl.wo, this._buf.attnOut, this._buf.proj, cl.wo, this.nEmb);
 
-            // --- Residual: hidden += proj ---
+            // --- Residual ---
             this._addResidual(this._buf.hidden, this._buf.proj, this.nEmb);
 
             // --- FFN norm ---
             this._copy(this._buf.hidden, this._buf.normed, this.nEmb);
-            const ffnNormF32Buf = this._getF32WeightBuf(cl.ffnNorm);
-            this._rmsnorm(this._buf.normed, ffnNormF32Buf, this.nEmb);
-            ffnNormF32Buf.destroy();
+            this._rmsnorm(this._buf.normed, gl.ffnNorm, this.nEmb);
 
             // --- FFN (dense or MoE) ---
             if (cl.isMoE) {
                 await this._moEFFNGPU(l, gl, cl, position);
             } else {
-                // Dense SwiGLU
                 this._matmul(gl.ffnGate, this._buf.normed, this._buf.gate, cl.ffnGate, this.nFF);
                 this._matmul(gl.ffnUp,   this._buf.normed, this._buf.up,   cl.ffnUp,   this.nFF);
                 this._siluMul(this._buf.gate, this._buf.up, this.nFF);
@@ -651,10 +765,9 @@ class Qwen3GPUEngine {
         }
 
         if (!skipLogits) {
-            const outNormBuf = this._getF32WeightBuf(cpu.outputNorm);
+            // Final norm + lm_head — only GPU→CPU sync in the whole forward pass
             this._copy(this._buf.hidden, this._buf.normed, this.nEmb);
-            this._rmsnorm(this._buf.normed, outNormBuf, this.nEmb);
-            outNormBuf.destroy();
+            this._rmsnorm(this._buf.normed, this._gpuW.outputNorm, this.nEmb);
             this._matmul(this._gpuW.output, this._buf.normed, this._buf.logits, cpu.output, this.nVocab);
             const logits = await g.readF32(this._buf.logits, this.nVocab);
             cpu.bufLogits.set(logits);
@@ -798,6 +911,9 @@ class Qwen3GPUEngine {
             abortSignal,
         } = options;
 
+        // GPU KV cache is overwritten from position 0 each generate() call;
+        // no explicit clear needed since positions are always written before read.
+        // CPU KV cache reset (kept for compatibility but not used by GPU attention)
         this.kvCache.reset();
 
         for (let i = 0; i < tokenIds.length - 1; i++) {
