@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Qwen3 MoE Router Visualizer</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: 'Segoe UI', sans-serif; background:#0d1117; color:#c9d1d9; display:flex; flex-direction:column; height:100vh; }
+
+#header { padding:10px 16px; border-bottom:1px solid #30363d; background:#161b22; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+#header h1 { font-size:1em; color:#58a6ff; }
+.btn { padding:5px 12px; border-radius:6px; border:1px solid #30363d; background:#21262d; color:#c9d1d9; cursor:pointer; font-size:0.82em; }
+.btn:hover { background:#30363d; }
+.btn.primary { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+.btn.active { background:#238636; border-color:#238636; }
+#fileInput { display:none; }
+#modelStatus { font-size:0.78em; color:#8b949e; margin-left:auto; }
+#modelStatus.ready { color:#3fb950; }
+
+#main { display:flex; flex:1; overflow:hidden; }
+
+#leftPanel { width:320px; border-right:1px solid #30363d; display:flex; flex-direction:column; overflow:hidden; }
+
+#promptArea { padding:10px; border-bottom:1px solid #30363d; }
+#promptArea textarea { width:100%; height:80px; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:6px; border-radius:4px; font-size:0.85em; resize:vertical; }
+#promptArea button { margin-top:6px; width:100%; }
+
+#tokenList { flex:1; overflow-y:auto; padding:8px; }
+#tokenList h3 { font-size:0.8em; color:#8b949e; margin-bottom:6px; padding-bottom:4px; border-bottom:1px solid #30363d; }
+.token-item { padding:4px 8px; border-radius:4px; cursor:pointer; font-size:0.82em; margin-bottom:2px; border:1px solid transparent; }
+.token-item:hover { background:#21262d; }
+.token-item.selected { background:#1f3a5f; border-color:#1f6feb; }
+.token-item .tok-id { color:#8b949e; font-size:0.8em; }
+
+#controls { padding:8px; border-top:1px solid #30363d; font-size:0.8em; }
+#controls label { display:flex; align-items:center; gap:6px; margin-bottom:4px; }
+
+#rightPanel { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+
+#vizArea { flex:1; overflow:auto; padding:12px; }
+
+#heatmapContainer { margin-bottom:16px; }
+#heatmapContainer h2 { font-size:0.9em; color:#8b949e; margin-bottom:8px; }
+#expertGrid { display:grid; grid-template-columns:repeat(16, 1fr); gap:2px; }
+.expert-cell {
+    aspect-ratio:1;
+    border-radius:2px;
+    background:#1c2128;
+    cursor:pointer;
+    position:relative;
+    transition:transform 0.1s;
+}
+.expert-cell:hover { transform:scale(1.1); z-index:1; }
+.expert-cell.selected-expert { outline:2px solid #f0c060; }
+.expert-cell.masked { outline:2px solid #f85149; opacity:0.5; }
+.expert-cell .tooltip {
+    display:none;
+    position:absolute;
+    bottom:110%;
+    left:50%;
+    transform:translateX(-50%);
+    background:#161b22;
+    border:1px solid #30363d;
+    padding:4px 8px;
+    border-radius:4px;
+    font-size:0.75em;
+    white-space:nowrap;
+    z-index:10;
+    pointer-events:none;
+}
+.expert-cell:hover .tooltip { display:block; }
+
+#layerHeatmap { margin-top:16px; }
+#layerHeatmap h2 { font-size:0.9em; color:#8b949e; margin-bottom:8px; }
+#layerCanvas { display:block; border:1px solid #30363d; }
+
+#statsPanel { padding:10px 12px; border-top:1px solid #30363d; font-size:0.8em; color:#8b949e; background:#161b22; display:flex; gap:20px; flex-wrap:wrap; }
+
+#breakpointPanel { padding:8px 12px; border-top:1px solid #30363d; background:#161b22; }
+#breakpointPanel h3 { font-size:0.8em; color:#8b949e; margin-bottom:6px; }
+#bpList { display:flex; gap:6px; flex-wrap:wrap; }
+.bp-chip { padding:2px 8px; background:#21262d; border:1px solid #30363d; border-radius:12px; font-size:0.75em; cursor:pointer; }
+.bp-chip:hover { border-color:#f85149; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>MoE Router Visualizer</h1>
+  <button class="btn" onclick="document.getElementById('fileInput').click()">📂 GGUFを読み込む</button>
+  <input type="file" id="fileInput" accept=".gguf">
+  <span id="modelStatus">モデル未読込</span>
+  <button id="gpuToggle" class="btn" onclick="toggleGPU()">GPU: Auto</button>
+</div>
+
+<div id="main">
+  <div id="leftPanel">
+    <div id="promptArea">
+      <textarea id="promptInput" placeholder="プロンプトを入力...">こんにちは、Qwen3です。</textarea>
+      <button class="btn primary" id="genBtn" onclick="startGeneration()" disabled>生成開始</button>
+    </div>
+    <div id="tokenList">
+      <h3>生成トークン (<span id="tokenCount">0</span>)</h3>
+      <div id="tokenItems"></div>
+    </div>
+    <div id="controls">
+      <label>
+        <input type="checkbox" id="showAllLayers" onchange="updateViz()"> 全レイヤー表示
+      </label>
+      <label>
+        表示レイヤー: <input type="number" id="layerSelect" value="0" min="0" max="63" style="width:50px; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px;" onchange="updateViz()">
+      </label>
+      <label>Max token: <input type="number" id="maxTokens" value="64" min="1" max="512" style="width:60px; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px;"></label>
+    </div>
+  </div>
+
+  <div id="rightPanel">
+    <div id="vizArea">
+      <div id="heatmapContainer">
+        <h2>Expert活性化ヒートマップ (クリックでマスク切替)</h2>
+        <div id="expertGrid"></div>
+      </div>
+      <div id="layerHeatmap">
+        <h2>レイヤー×Expert活性化（選択トークン）</h2>
+        <canvas id="layerCanvas" width="800" height="400"></canvas>
+      </div>
+    </div>
+    <div id="statsPanel">
+      <span id="statToken">トークン: -</span>
+      <span id="statLayer">レイヤー: -</span>
+      <span id="statTopExperts">Top experts: -</span>
+      <span id="statTPS">速度: - tok/s</span>
+    </div>
+    <div id="breakpointPanel">
+      <h3>ブレークポイント</h3>
+      <div id="bpList">
+        <button class="btn" onclick="addBreakpoint()" style="font-size:0.75em; padding:2px 8px;">+ 追加</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="../src/gguf.js"></script>
+<script src="../src/tokenizer.js"></script>
+<script src="../src/tensor.js"></script>
+<script src="../src/kv-cache.js"></script>
+<script src="../src/qwen3-engine.js"></script>
+<script src="../src/webgpu.js"></script>
+
+<script>
+let engine = null;
+let useGPU = true;
+let routerHistory = [];   // [{layer, token, probs[128], selected[8], weights[8]}]
+let generatedTokenIds = [];
+let selectedTokenIdx = -1;
+let maskedExperts = new Set();
+let breakpoints = [];
+let isGenerating = false;
+let isPaused = false;
+let resumeResolve = null;
+let startTime = 0;
+let tokenCount = 0;
+
+// --- Model Loading ---
+document.getElementById('fileInput').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const status = document.getElementById('modelStatus');
+    status.textContent = '読み込み中...';
+    const buffer = await file.arrayBuffer();
+    try {
+        const gguf = new GGUFReader(buffer);
+        if (useGPU) {
+            try {
+                engine = await Qwen3GPUEngine.create(gguf);
+                status.textContent = `[GPU] ${gguf.getKeyValue('general.name', file.name)}`;
+            } catch (gpuErr) {
+                console.warn('GPU failed, CPU fallback:', gpuErr);
+                engine = new Qwen3Engine(gguf);
+                status.textContent = `[CPU] ${gguf.getKeyValue('general.name', file.name)}`;
+            }
+        } else {
+            engine = new Qwen3Engine(gguf);
+            status.textContent = `[CPU] ${gguf.getKeyValue('general.name', file.name)}`;
+        }
+        status.className = 'ready';
+        document.getElementById('genBtn').disabled = false;
+        document.getElementById('layerSelect').max = engine.nLayers - 1;
+        initExpertGrid(engine.isMoE ? 128 : 0);
+    } catch (err) {
+        status.textContent = `エラー: ${err.message}`;
+        console.error(err);
+    }
+});
+
+function toggleGPU() {
+    useGPU = !useGPU;
+    document.getElementById('gpuToggle').textContent = `GPU: ${useGPU ? 'ON' : 'OFF'}`;
+    document.getElementById('gpuToggle').className = useGPU ? 'btn active' : 'btn';
+}
+
+// --- Expert Grid ---
+function initExpertGrid(nExperts) {
+    const grid = document.getElementById('expertGrid');
+    grid.innerHTML = '';
+    if (nExperts === 0) {
+        grid.textContent = '(Dense model - no experts)';
+        return;
+    }
+    grid.style.gridTemplateColumns = `repeat(${Math.min(16, nExperts)}, 1fr)`;
+    for (let i = 0; i < nExperts; i++) {
+        const cell = document.createElement('div');
+        cell.className = 'expert-cell';
+        cell.id = `expert-${i}`;
+        cell.title = `Expert ${i}`;
+        cell.innerHTML = `<div class="tooltip">Expert ${i}<br>prob: 0.000</div>`;
+        cell.onclick = () => toggleExpertMask(i, cell);
+        grid.appendChild(cell);
+    }
+}
+
+function toggleExpertMask(expertIdx, cell) {
+    if (maskedExperts.has(expertIdx)) {
+        maskedExperts.delete(expertIdx);
+        cell.classList.remove('masked');
+    } else {
+        maskedExperts.add(expertIdx);
+        cell.classList.add('masked');
+    }
+    if (engine) engine.expertMask = maskedExperts;
+}
+
+// --- Generation ---
+async function startGeneration() {
+    if (isGenerating) return;
+    isGenerating = true;
+    routerHistory = [];
+    generatedTokenIds = [];
+    tokenCount = 0;
+    startTime = performance.now();
+
+    document.getElementById('tokenItems').innerHTML = '';
+    document.getElementById('tokenCount').textContent = '0';
+    document.getElementById('genBtn').disabled = true;
+
+    const prompt = document.getElementById('promptInput').value;
+    const tokenIds = engine.tokenizer.tokenize(prompt, true, false);
+    const maxSteps = parseInt(document.getElementById('maxTokens').value) || 64;
+
+    engine.expertMask = maskedExperts;
+    engine.onRouterUpdate = onRouterUpdate;
+
+    await engine.generate(tokenIds, {
+        maxSteps,
+        temperature: 0.7,
+        topP: 0.9,
+        topK: 40,
+        onToken(tokenId) {
+            tokenCount++;
+            generatedTokenIds.push(tokenId);
+            const text = engine.tokenizer.decode([tokenId]);
+            addTokenChip(tokenId, text, generatedTokenIds.length - 1);
+            document.getElementById('tokenCount').textContent = tokenCount;
+            document.getElementById('statTPS').textContent =
+                `速度: ${(tokenCount / ((performance.now() - startTime) / 1000)).toFixed(1)} tok/s`;
+        },
+    });
+
+    isGenerating = false;
+    document.getElementById('genBtn').disabled = false;
+}
+
+function addTokenChip(tokenId, text, idx) {
+    const el = document.createElement('div');
+    el.className = 'token-item';
+    el.innerHTML = `<span>${escHtml(text || '?')}</span> <span class="tok-id">#${tokenId}</span>`;
+    el.onclick = () => selectToken(idx, el);
+    document.getElementById('tokenItems').appendChild(el);
+    el.scrollIntoView({ block: 'nearest' });
+}
+
+function selectToken(idx, el) {
+    document.querySelectorAll('.token-item.selected').forEach(e => e.classList.remove('selected'));
+    el.classList.add('selected');
+    selectedTokenIdx = idx;
+    updateViz();
+}
+
+function onRouterUpdate(data) {
+    routerHistory.push(data);
+    // Update expert grid for the current token's latest layer
+    const layerIdx = parseInt(document.getElementById('layerSelect').value);
+    if (data.layer === layerIdx) {
+        updateExpertGrid(data);
+    }
+    document.getElementById('statLayer').textContent = `レイヤー: ${data.layer}`;
+    if (data.selected) {
+        document.getElementById('statTopExperts').textContent = `Top: ${data.selected.slice(0,3).join(', ')}...`;
+    }
+}
+
+function updateExpertGrid(data) {
+    const { probs, selected } = data;
+    const maxProb = Math.max(...probs);
+    probs.forEach((p, i) => {
+        const cell = document.getElementById(`expert-${i}`);
+        if (!cell) return;
+        const intensity = maxProb > 0 ? p / maxProb : 0;
+        const isSelected = selected && selected.includes(i);
+        // Color: selected = orange-ish, others = blue gradient
+        const r = isSelected ? Math.round(255 * intensity) : Math.round(30 + 40 * intensity);
+        const g = isSelected ? Math.round(150 * intensity) : Math.round(40 + 60 * intensity);
+        const b = isSelected ? 0 : Math.round(80 + 120 * intensity);
+        cell.style.background = `rgb(${r},${g},${b})`;
+        cell.querySelector('.tooltip').textContent = `Expert ${i}\nprob: ${p.toFixed(4)}`;
+        cell.classList.toggle('selected-expert', isSelected);
+    });
+}
+
+function updateViz() {
+    const layerIdx = parseInt(document.getElementById('layerSelect').value);
+    // Find router data for selected token + layer
+    const tokenIdx = selectedTokenIdx;
+    if (tokenIdx < 0 || routerHistory.length === 0) return;
+
+    const entry = routerHistory.find(h => h.layer === layerIdx);
+    if (entry) updateExpertGrid(entry);
+
+    drawLayerHeatmap(tokenIdx);
+}
+
+function drawLayerHeatmap(tokenIdx) {
+    const canvas = document.getElementById('layerCanvas');
+    const ctx = canvas.getContext('2d');
+    const nExperts = 128;
+
+    // Collect all layers for the current token
+    // routerHistory entries for this token are every nLayers entries
+    const nLayers = engine ? engine.nLayers : 0;
+    if (nLayers === 0) return;
+
+    // routerHistory is flat: for each token, nLayers entries
+    // Entry index = tokenIdx * nLayers + layerIdx (approx, for MoE layers)
+    const tokenEntries = routerHistory.filter((_, i) => Math.floor(i / nLayers) === tokenIdx);
+
+    canvas.width = Math.min(nExperts * 6, 800);
+    canvas.height = Math.max(tokenEntries.length * 10, 100);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const cellW = canvas.width / nExperts;
+    const cellH = Math.max(canvas.height / Math.max(tokenEntries.length, 1), 8);
+
+    tokenEntries.forEach((entry, li) => {
+        const maxP = Math.max(...entry.probs);
+        entry.probs.forEach((p, ei) => {
+            const intensity = maxP > 0 ? p / maxP : 0;
+            const isSelected = entry.selected && entry.selected.includes(ei);
+            ctx.fillStyle = isSelected
+                ? `rgba(255,180,0,${0.3 + 0.7 * intensity})`
+                : `rgba(30,100,200,${intensity * 0.8})`;
+            ctx.fillRect(ei * cellW, li * cellH, cellW - 1, cellH - 1);
+        });
+        ctx.fillStyle = '#8b949e';
+        ctx.font = '7px monospace';
+        ctx.fillText(`L${entry.layer}`, 2, li * cellH + cellH - 2);
+    });
+}
+
+// --- Breakpoints ---
+function addBreakpoint() {
+    const type = prompt('ブレークポイントタイプ:\n1: token文字列\n2: expert番号\n3: tokenId', '1');
+    if (!type) return;
+    let bp;
+    if (type === '1') {
+        const val = prompt('停止する文字列:');
+        if (!val) return;
+        bp = { type: 'token', value: val };
+    } else if (type === '2') {
+        const val = parseInt(prompt('停止するExpert番号:'));
+        if (isNaN(val)) return;
+        bp = { type: 'expert', value: val };
+    } else {
+        const val = parseInt(prompt('停止するToken ID:'));
+        if (isNaN(val)) return;
+        bp = { type: 'tokenId', value: val };
+    }
+    breakpoints.push(bp);
+    renderBreakpoints();
+}
+
+function renderBreakpoints() {
+    const list = document.getElementById('bpList');
+    list.innerHTML = '<button class="btn" onclick="addBreakpoint()" style="font-size:0.75em; padding:2px 8px;">+ 追加</button>';
+    breakpoints.forEach((bp, i) => {
+        const chip = document.createElement('span');
+        chip.className = 'bp-chip';
+        chip.textContent = `${bp.type}:${bp.value} ✕`;
+        chip.onclick = () => { breakpoints.splice(i, 1); renderBreakpoints(); };
+        list.appendChild(chip);
+    });
+}
+
+function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+</script>
+</body>
+</html>

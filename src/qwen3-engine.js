@@ -20,9 +20,6 @@ class Qwen3Engine {
         // Derive nVocab from embedding tensor shape[1] (row-major: [n_embd, n_vocab])
         const embShape = this.tokEmbd.shape;
         this.nVocab = embShape[1];
-        
-        // Derive nFF from ffn gate weight shape[1]
-        this.nFF = this.layers[0].ffnGate.shape[1];
 
         // Pre-allocate working buffers (derives headDimQ/headDimKV from actual weight shapes)
         this._allocBuffers();
@@ -39,8 +36,15 @@ class Qwen3Engine {
         this.output = outputTensor || this.tokEmbd;
 
         this.layers = new Array(this.nLayers);
+        this.isMoE = false;
+
         for (let i = 0; i < this.nLayers; i++) {
             const p = `blk.${i}`;
+            // MoE layers have ffn_gate_inp (router) instead of ffn_gate
+            const routerWeight = gguf.getTensorMetaByName(`${p}.ffn_gate_inp.weight`);
+            const isMoELayer = routerWeight != null;
+            if (isMoELayer) this.isMoE = true;
+
             this.layers[i] = {
                 attnNorm: gguf.getTensorMetaByName(`${p}.attn_norm.weight`),
                 wq:       gguf.getTensorMetaByName(`${p}.attn_q.weight`),
@@ -50,46 +54,61 @@ class Qwen3Engine {
                 qNorm:    gguf.getTensorMetaByName(`${p}.attn_q_norm.weight`),
                 kNorm:    gguf.getTensorMetaByName(`${p}.attn_k_norm.weight`),
                 ffnNorm:  gguf.getTensorMetaByName(`${p}.ffn_norm.weight`),
+                // Dense FFN weights
                 ffnGate:  gguf.getTensorMetaByName(`${p}.ffn_gate.weight`),
                 ffnUp:    gguf.getTensorMetaByName(`${p}.ffn_up.weight`),
                 ffnDown:  gguf.getTensorMetaByName(`${p}.ffn_down.weight`),
+                // MoE weights (null for dense layers)
+                isMoE: isMoELayer,
+                routerWeight,
+                ffnGateExps: gguf.getTensorMetaByName(`${p}.ffn_gate_exps.weight`),
+                ffnUpExps:   gguf.getTensorMetaByName(`${p}.ffn_up_exps.weight`),
+                ffnDownExps: gguf.getTensorMetaByName(`${p}.ffn_down_exps.weight`),
+                nExperts:    128,
+                nExpertsUsed: 8,
             };
         }
     }
 
     _allocBuffers() {
-        // Derive actual dimensions from weight tensor shapes (row-major: shape=[in, out], shape[1]=output dim)
-        const wqShape = this.layers[0].wq.shape;  // [n_embd, nQ]
-        const wkShape = this.layers[0].wk.shape;  // [n_embd, nKV]
-        const woShape = this.layers[0].wo.shape;  // [nQ, n_embd]
-        const ffnGateShape = this.layers[0].ffnGate.shape; // [n_embd, nFF]
+        const wqShape = this.layers[0].wq.shape;
+        const wkShape = this.layers[0].wk.shape;
+        const woShape = this.layers[0].wo.shape;
 
         this.nQ   = wqShape[1];
         this.nKV  = wkShape[1];
         this.headDimQ = this.nQ / this.nHeads;
         this.headDimKV = this.nKV / this.nHeadKV;
         const nEmbActual = woShape[1];
-        const nFFActual = ffnGateShape[1];
 
-        this.bufHidden  = new Float32Array(nEmbActual);
-        this.bufResidual = new Float32Array(nEmbActual);
-        this.bufNormed   = new Float32Array(nEmbActual);
-        this.bufQ        = new Float32Array(this.nQ);
-        this.bufK        = new Float32Array(this.nKV);
-        this.bufV        = new Float32Array(this.nKV);
-        this.bufAttnOut  = new Float32Array(this.nQ);
-        this.bufFFN      = new Float32Array(nFFActual);
-        this.bufFFNTmp   = new Float32Array(nFFActual);
-        this.bufLogits   = new Float32Array(this.nVocab);
+        // For MoE: nFF is the expert hidden dim (from gate_exps), for dense: from ffnGate
+        let nFFActual;
+        const l0 = this.layers[0];
+        if (l0.isMoE) {
+            nFFActual = l0.ffnGateExps.shape[1];  // expert hidden dim
+        } else {
+            nFFActual = l0.ffnGate.shape[1];
+        }
+        this.nFF = nFFActual;
 
-        // Attention score buffer: [nHeads, maxSeqLen] — reused each step
+        this.bufHidden     = new Float32Array(nEmbActual);
+        this.bufResidual   = new Float32Array(nEmbActual);
+        this.bufNormed     = new Float32Array(nEmbActual);
+        this.bufQ          = new Float32Array(this.nQ);
+        this.bufK          = new Float32Array(this.nKV);
+        this.bufV          = new Float32Array(this.nKV);
+        this.bufAttnOut    = new Float32Array(this.nQ);
+        this.bufFFN        = new Float32Array(nFFActual);
+        this.bufFFNTmp     = new Float32Array(nFFActual);
+        this.bufMoEOut     = new Float32Array(nEmbActual);
+        this.bufLogits     = new Float32Array(this.nVocab);
         this.bufAttnScores = new Float32Array(this.nHeads * this.maxCtx);
     }
 
     // --- Single forward pass for one token ---
     // When skipLogits=true (prefill), we don't compute the expensive logits step
     forward(tokenId, position, skipLogits = false) {
-        const emb = embeddingLookupQ80(this.tokEmbd, tokenId);
+        const emb = embeddingLookupGeneric(this.tokEmbd, tokenId);
         if (position === 0) {
             let sum = 0; for (let i = 0; i < Math.min(16, emb.length); i++) sum += Math.abs(emb[i]);
             console.log(`[EMB] token=${tokenId}, first16 avgAbs=${(sum/16).toFixed(4)}, max=${Math.max(...Array.from(emb.slice(0,128)).map(Math.abs)).toFixed(4)}`);
@@ -123,13 +142,13 @@ class Qwen3Engine {
             }
 
             // Q / K / V projections
-            const qOut = matmulQ80xF32(layer.wq, this.bufNormed);
+            const qOut = matmulGeneric(layer.wq, this.bufNormed);
             this.bufQ.set(qOut);
 
-            const kOut = matmulQ80xF32(layer.wk, this.bufNormed);
+            const kOut = matmulGeneric(layer.wk, this.bufNormed);
             this.bufK.set(kOut);
 
-            const vOut = matmulQ80xF32(layer.wv, this.bufNormed);
+            const vOut = matmulGeneric(layer.wv, this.bufNormed);
             this.bufV.set(vOut);
 
             if (position === 0 && l === 0) {
@@ -171,17 +190,19 @@ class Qwen3Engine {
             this.bufNormed.set(this.bufHidden);
             rmsnorm(this.bufNormed, layer.ffnNorm, this.eps);
 
-            // SwiGLU: silu(x @ gate) * (x @ up) @ down
-            const gateOut = matmulQ80xF32(layer.ffnGate, this.bufNormed);
-            this.bufFFN.set(gateOut);
-            siluInPlace(this.bufFFN);
-
-            const upOut = matmulQ80xF32(layer.ffnUp, this.bufNormed);
-            this.bufFFNTmp.set(upOut);
-            mulInPlace(this.bufFFN, this.bufFFNTmp);
-
-            const downOut = matmulQ80xF32(layer.ffnDown, this.bufFFN);
-            addVec(this.bufHidden, downOut);
+            if (layer.isMoE) {
+                this._moEFFN(l, layer);
+            } else {
+                // Dense SwiGLU: silu(x @ gate) * (x @ up) @ down
+                const gateOut = matmulGeneric(layer.ffnGate, this.bufNormed);
+                this.bufFFN.set(gateOut);
+                siluInPlace(this.bufFFN);
+                const upOut = matmulGeneric(layer.ffnUp, this.bufNormed);
+                this.bufFFNTmp.set(upOut);
+                mulInPlace(this.bufFFN, this.bufFFNTmp);
+                const downOut = matmulGeneric(layer.ffnDown, this.bufFFN);
+                addVec(this.bufHidden, downOut);
+            }
 
             if (position === 0 && l < 3) {
                 let m = 0; for (let i = 0; i < this.bufHidden.length; i++) { const a = Math.abs(this.bufHidden[i]); if (a > m) m = a; }
@@ -189,7 +210,7 @@ class Qwen3Engine {
             }
         }
 
-        // Output norm + lm_head → logits (skip during prefill for speed)
+        // Output norm + lm_head → logits
         if (!skipLogits) {
             rmsnorm(this.bufHidden, this.outputNorm, this.eps);
             
@@ -201,7 +222,7 @@ class Qwen3Engine {
             }
             console.log(`[HIDDEN] pos=${position}, maxAbs=${hMax.toFixed(4)}, hasNaN=${this.bufHidden.some(v => v !== v)}`);
             
-            const logitsResult = logitsFromQ80(this.output, this.bufHidden);
+            const logitsResult = matmulGeneric(this.output, this.bufHidden);
             this.bufLogits.set(logitsResult);
             
             // Debug: top-5 logits
@@ -267,8 +288,101 @@ class Qwen3Engine {
         }
 
         // Output projection: wo @ bufAttnOut → n_embd result
-        const projResult = matmulQ80xF32(woMeta, this.bufAttnOut);
+        const projResult = matmulGeneric(woMeta, this.bufAttnOut);
         return projResult;
+    }
+
+    // --- MoE FFN: router on CPU, expert matmuls on CPU (GPU override in Qwen3GPUEngine) ---
+    _moEFFN(layerIdx, layer) {
+        // Router: (2048 × 128) F32 matmul on CPU
+        const routerLogits = matmulGeneric(layer.routerWeight, this.bufNormed);
+        softmaxInPlace(routerLogits, 0, routerLogits.length);
+
+        // Select top-K experts
+        const topK = layer.nExpertsUsed;
+        const topIndices = [], topWeights = [];
+        const sorted = Array.from(routerLogits).map((v, i) => [v, i]);
+        sorted.sort((a, b) => b[0] - a[0]);
+        for (let k = 0; k < topK; k++) {
+            topIndices.push(sorted[k][1]);
+            topWeights.push(sorted[k][0]);
+        }
+        // Re-normalize weights
+        let sumW = 0;
+        for (const w of topWeights) sumW += w;
+        const invSum = sumW > 0 ? 1 / sumW : 0;
+
+        // Notify visualization callbacks
+        if (this.onRouterUpdate) {
+            this.onRouterUpdate({
+                layer: layerIdx,
+                probs: Array.from(routerLogits),
+                selected: topIndices,
+                weights: topWeights.map(w => w * invSum),
+            });
+        }
+
+        // Accumulate expert outputs
+        this.bufMoEOut.fill(0);
+
+        for (let k = 0; k < topK; k++) {
+            const expertIdx = topIndices[k];
+            // Apply expert mask if set
+            if (this.expertMask && this.expertMask.has(expertIdx)) continue;
+            const weight = topWeights[k] * invSum;
+
+            // Extract single expert's weights as slice metadata
+            const gateSlice = this._expertSlice(layer.ffnGateExps, expertIdx);
+            const upSlice   = this._expertSlice(layer.ffnUpExps, expertIdx);
+            const downSlice = this._expertSlice(layer.ffnDownExps, expertIdx);
+
+            // gate = silu(normed @ gate_exps[:,expert]) * (normed @ up_exps[:,expert])
+            const gateOut = matmulGeneric(gateSlice, this.bufNormed);
+            siluInPlace(gateOut);
+            const upOut = matmulGeneric(upSlice, this.bufNormed);
+            mulInPlace(gateOut, upOut);
+
+            // down = gateOut @ down_exps[:,expert]
+            const downOut = matmulGeneric(downSlice, gateOut);
+
+            // Weighted accumulate
+            for (let i = 0; i < downOut.length; i++) {
+                this.bufMoEOut[i] += weight * downOut[i];
+            }
+        }
+
+        addVec(this.bufHidden, this.bufMoEOut);
+    }
+
+    // Return metadata for a single expert's weight slice from a 3D tensor [inDim, hidDim, nExperts]
+    _expertSlice(meta, expertIdx) {
+        const inDim = meta.shape[0];
+        const hidDim = meta.shape[1];
+        const blockSize = this._blockSizeForType(meta.type);
+        const elemsPerBlock = meta.type >= 10 ? 256 : 32;  // k-quants=256, q8_0=32
+        const blocksPerCol = Math.ceil(inDim / elemsPerBlock);
+        const bytesPerCol = blocksPerCol * blockSize;
+        const expertOffset = expertIdx * hidDim * bytesPerCol;
+        return {
+            buffer: meta.buffer,
+            offset: meta.offset + expertOffset,
+            nbytes: hidDim * bytesPerCol,
+            shape: [inDim, hidDim],
+            type: meta.type,
+        };
+    }
+
+    _blockSizeForType(type) {
+        switch (type) {
+            case 0: return 4;   // F32 bytes per element
+            case 8: return 34;  // Q8_0
+            case 10: return 84;  // Q2_K
+            case 11: return 110; // Q3_K
+            case 12: return 144; // Q4_K
+            case 13: return 176; // Q5_K
+            case 14: return 210; // Q6_K
+            default: return 34;
+        }
     }
 
     // --- Generation loop ---

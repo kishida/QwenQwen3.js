@@ -84,6 +84,7 @@ body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
 <script src="../src/tensor.js"></script>
 <script src="../src/kv-cache.js"></script>
 <script src="../src/qwen3-engine.js"></script>
+<script src="../src/webgpu.js"></script>
 
 <script>
 let engine = null;
@@ -116,11 +117,21 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
         progressFill.style.width = '60%';
         await new Promise(r => setTimeout(r, 50));
 
-        engine = new Qwen3Engine(gguf);
+        // Try GPU engine first, fall back to CPU
+        let gpuLabel = '';
+        try {
+            engine = await Qwen3GPUEngine.create(gguf);
+            gpuLabel = ' | ⚡ WebGPU';
+        } catch (gpuErr) {
+            console.warn('[GPU] Unavailable, falling back to CPU:', gpuErr.message);
+            engine = new Qwen3Engine(gguf);
+            gpuLabel = ' | CPU';
+        }
         progressFill.style.width = '100%';
 
         const arch = gguf.getArch();
-        statusEl.textContent = `${gguf.getKeyValue('general.name', file.name)} | ${arch.blockCount}L ${arch.embeddingLength}d | 推論準備OK`;
+        const moeLabel = engine.isMoE ? ' MoE' : '';
+        statusEl.textContent = `${gguf.getKeyValue('general.name', file.name)} | ${arch.blockCount}L ${arch.embeddingLength}d${moeLabel}${gpuLabel} | 準備OK`;
         statusEl.className = 'ready';
 
         document.getElementById('messageInput').disabled = false;

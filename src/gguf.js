@@ -298,16 +298,20 @@ class GGUFReader {
                 // block_q5_1: d(2) + dmin(2) + qs[32] + qh[4] = 44 bytes per 32 elements
                 return Math.ceil(totalElems / 32) * 44;
             case GGUFReader.TENSOR_TYPES.Q2_K:
-                // block_q2_K: d(2) + s(2) + scales[16] + qs[16] = 38 bytes per 16 elements (QK_K=256, QK_K/16=16 blocks)
-                return Math.ceil(totalElems / 256) * (4 + 2 + 32 + 128); // simplified
+                // d(2)+dmin(2)+scales[16]+qs[64] = 84 bytes per 256 elements
+                return Math.ceil(totalElems / 256) * 84;
             case GGUFReader.TENSOR_TYPES.Q3_K:
-                return Math.ceil(totalElems / 256) * (4 + 128 + 32 + 32); // simplified
+                // hmask[32]+qs[64]+scales[12]+d(2) = 110 bytes per 256 elements
+                return Math.ceil(totalElems / 256) * 110;
             case GGUFReader.TENSOR_TYPES.Q4_K:
-                return Math.ceil(totalElems / 256) * (4 + 2 + 128 + 64); // simplified
+                // d(2)+dmin(2)+scales[12]+qs[128] = 144 bytes per 256 elements
+                return Math.ceil(totalElems / 256) * 144;
             case GGUFReader.TENSOR_TYPES.Q5_K:
-                return Math.ceil(totalElems / 256) * (4 + 2 + 128 + 64 + 32); // simplified
+                // d(2)+dmin(2)+scales[12]+qh[32]+qs[128] = 176 bytes per 256 elements
+                return Math.ceil(totalElems / 256) * 176;
             case GGUFReader.TENSOR_TYPES.Q6_K:
-                return Math.ceil(totalElems / 256) * (4 + 128 + 32 + 32); // simplified
+                // ql[128]+qh[64]+scales[16]+d(2) = 210 bytes per 256 elements
+                return Math.ceil(totalElems / 256) * 210;
             default:
                 console.warn(`Unknown tensor type ${type}, assuming F32`);
                 return totalElems * 4;

@@ -236,6 +236,375 @@ function sampleGreedy(logits) {
     return maxIdx;
 }
 
+// === k-quant CPU dequantization (Q2_K through Q6_K) ===
+// All k-quants: QK_K=256 elements per superblock, column-major storage
+
+const QK_K = 256;
+const BLOCK_SIZE_Q2_K = 84;   // d(2)+dmin(2)+scales[16]+qs[64]
+const BLOCK_SIZE_Q3_K = 110;  // hmask[32]+qs[64]+scales[12]+d(2)
+const BLOCK_SIZE_Q4_K = 144;  // d(2)+dmin(2)+scales[12]+qs[128]
+const BLOCK_SIZE_Q5_K = 176;  // d(2)+dmin(2)+scales[12]+qh[32]+qs[128]
+const BLOCK_SIZE_Q6_K = 210;  // ql[128]+qh[64]+scales[16]+d(2)
+
+// Extract scale/min for Q4_K/Q5_K 8-sub-block format (12-byte scales array)
+function _q4kGetScaleMin(u8, scaleBase, sub) {
+    let s, m;
+    if (sub < 4) {
+        s = u8[scaleBase + sub] & 63;
+        m = u8[scaleBase + sub + 4] & 63;
+    } else {
+        const ss = sub - 4;
+        s = (u8[scaleBase + sub + 4] & 0xF) | ((u8[scaleBase + ss] >> 6) << 4);
+        m = (u8[scaleBase + sub + 4] >> 4)  | ((u8[scaleBase + sub] >> 6) << 4);
+    }
+    return [s, m];
+}
+
+// Q3_K: extract 6-bit scale for sub-block j (0..15) from 12-byte scales array
+// Packing: lo4 in nibbles of bytes 0-7, hi2 packed 4-per-byte in bytes 8-11
+function _q3kGetScale(u8, scaleBase, j) {
+    const lo4 = (u8[scaleBase + (j >> 1)] >> ((j & 1) << 2)) & 0xF;
+    const hi2 = (u8[scaleBase + 8 + (j >> 2)] >> ((j & 3) << 1)) & 0x3;
+    return lo4 | (hi2 << 4);
+}
+
+function matmulQ2KxF32(meta, input) {
+    const inDim = meta.shape[0], outDim = meta.shape[1];
+    const blocksPerCol = Math.ceil(inDim / QK_K);
+    const u8 = new Uint8Array(meta.buffer);
+    const dv = new DataView(meta.buffer);
+    const output = new Float32Array(outDim);
+    for (let c = 0; c < outDim; c++) {
+        const colBase = meta.offset + c * blocksPerCol * BLOCK_SIZE_Q2_K;
+        let dot = 0;
+        for (let b = 0; b < blocksPerCol; b++) {
+            const bb = colBase + b * BLOCK_SIZE_Q2_K;
+            const d = dv.getFloat16(bb, true);
+            const dmin = dv.getFloat16(bb + 2, true);
+            const elemBase = b * QK_K;
+            const maxElem = Math.min(QK_K, inDim - elemBase);
+            for (let e = 0; e < maxElem; e++) {
+                const sub = e >> 4;
+                const scaleByte = u8[bb + 4 + sub];
+                const scale = scaleByte & 0xF;
+                const minVal = (scaleByte >> 4) & 0xF;
+                const q = (u8[bb + 20 + (e >> 2)] >> ((e & 3) << 1)) & 0x3;
+                dot += input[elemBase + e] * (d * scale * q - dmin * minVal);
+            }
+        }
+        output[c] = dot;
+    }
+    return output;
+}
+
+function matmulQ3KxF32(meta, input) {
+    // Block layout: hmask[32] qs[64] scales[12] d[2]
+    const inDim = meta.shape[0], outDim = meta.shape[1];
+    const blocksPerCol = Math.ceil(inDim / QK_K);
+    const u8 = new Uint8Array(meta.buffer);
+    const dv = new DataView(meta.buffer);
+    const output = new Float32Array(outDim);
+    for (let c = 0; c < outDim; c++) {
+        const colBase = meta.offset + c * blocksPerCol * BLOCK_SIZE_Q3_K;
+        let dot = 0;
+        for (let b = 0; b < blocksPerCol; b++) {
+            const bb = colBase + b * BLOCK_SIZE_Q3_K;
+            const d = dv.getFloat16(bb + 108, true);
+            const elemBase = b * QK_K;
+            const maxElem = Math.min(QK_K, inDim - elemBase);
+            for (let e = 0; e < maxElem; e++) {
+                const sub = e >> 4;
+                const scale = _q3kGetScale(u8, bb + 96, sub);
+                const hmaskBit = (u8[bb + (e >> 3)] >> (e & 7)) & 1;
+                const low2 = (u8[bb + 32 + (e >> 2)] >> ((e & 3) << 1)) & 3;
+                const q3 = low2 | (hmaskBit << 2);
+                dot += input[elemBase + e] * (d * scale * (q3 - 4));
+            }
+        }
+        output[c] = dot;
+    }
+    return output;
+}
+
+function matmulQ4KxF32(meta, input) {
+    // Block layout: d[2] dmin[2] scales[12] qs[128]
+    const inDim = meta.shape[0], outDim = meta.shape[1];
+    const blocksPerCol = Math.ceil(inDim / QK_K);
+    const u8 = new Uint8Array(meta.buffer);
+    const dv = new DataView(meta.buffer);
+    const output = new Float32Array(outDim);
+    for (let c = 0; c < outDim; c++) {
+        const colBase = meta.offset + c * blocksPerCol * BLOCK_SIZE_Q4_K;
+        let dot = 0;
+        for (let b = 0; b < blocksPerCol; b++) {
+            const bb = colBase + b * BLOCK_SIZE_Q4_K;
+            const d = dv.getFloat16(bb, true);
+            const dmin = dv.getFloat16(bb + 2, true);
+            const elemBase = b * QK_K;
+            const maxElem = Math.min(QK_K, inDim - elemBase);
+            for (let e = 0; e < maxElem; e++) {
+                const sub = e >> 5;  // 8 sub-blocks of 32 elements
+                const [sc, mn] = _q4kGetScaleMin(u8, bb + 4, sub);
+                const qsByte = u8[bb + 16 + (e >> 1)];
+                const q4 = e & 1 ? (qsByte >> 4) & 0xF : qsByte & 0xF;
+                dot += input[elemBase + e] * (d * sc * q4 - dmin * mn);
+            }
+        }
+        output[c] = dot;
+    }
+    return output;
+}
+
+function matmulQ5KxF32(meta, input) {
+    // Block layout: d[2] dmin[2] scales[12] qh[32] qs[128]
+    const inDim = meta.shape[0], outDim = meta.shape[1];
+    const blocksPerCol = Math.ceil(inDim / QK_K);
+    const u8 = new Uint8Array(meta.buffer);
+    const dv = new DataView(meta.buffer);
+    const output = new Float32Array(outDim);
+    for (let c = 0; c < outDim; c++) {
+        const colBase = meta.offset + c * blocksPerCol * BLOCK_SIZE_Q5_K;
+        let dot = 0;
+        for (let b = 0; b < blocksPerCol; b++) {
+            const bb = colBase + b * BLOCK_SIZE_Q5_K;
+            const d = dv.getFloat16(bb, true);
+            const dmin = dv.getFloat16(bb + 2, true);
+            const elemBase = b * QK_K;
+            const maxElem = Math.min(QK_K, inDim - elemBase);
+            for (let e = 0; e < maxElem; e++) {
+                const sub = e >> 5;
+                const [sc, mn] = _q4kGetScaleMin(u8, bb + 4, sub);
+                const highBit = (u8[bb + 16 + (e >> 3)] >> (e & 7)) & 1;
+                const qsByte = u8[bb + 48 + (e >> 1)];
+                const low4 = e & 1 ? (qsByte >> 4) & 0xF : qsByte & 0xF;
+                const q5 = low4 | (highBit << 4);
+                dot += input[elemBase + e] * (d * sc * q5 - dmin * mn);
+            }
+        }
+        output[c] = dot;
+    }
+    return output;
+}
+
+function matmulQ6KxF32(meta, input) {
+    // Block layout: ql[128] qh[64] scales[16] d[2]
+    const inDim = meta.shape[0], outDim = meta.shape[1];
+    const blocksPerCol = Math.ceil(inDim / QK_K);
+    const u8 = new Uint8Array(meta.buffer);
+    const dv = new DataView(meta.buffer);
+    const output = new Float32Array(outDim);
+    for (let c = 0; c < outDim; c++) {
+        const colBase = meta.offset + c * blocksPerCol * BLOCK_SIZE_Q6_K;
+        let dot = 0;
+        for (let b = 0; b < blocksPerCol; b++) {
+            const bb = colBase + b * BLOCK_SIZE_Q6_K;
+            const d = dv.getFloat16(bb + 208, true);
+            const elemBase = b * QK_K;
+            const maxElem = Math.min(QK_K, inDim - elemBase);
+            for (let e = 0; e < maxElem; e++) {
+                const sub = e >> 4;  // 16 sub-blocks of 16 elements
+                const scaleByte = u8[bb + 192 + sub];
+                const scale = scaleByte >= 128 ? scaleByte - 256 : scaleByte;
+                const qlByte = u8[bb + (e >> 1)];
+                const low4 = e & 1 ? (qlByte >> 4) & 0xF : qlByte & 0xF;
+                const high2 = (u8[bb + 128 + (e >> 2)] >> ((e & 3) << 1)) & 0x3;
+                const q6 = low4 | (high2 << 4);
+                dot += input[elemBase + e] * (d * scale * (q6 - 32));
+            }
+        }
+        output[c] = dot;
+    }
+    return output;
+}
+
+function matmulF32xF32(meta, input) {
+    const inDim = meta.shape[0], outDim = meta.shape[1];
+    const dv = new DataView(meta.buffer);
+    const output = new Float32Array(outDim);
+    for (let c = 0; c < outDim; c++) {
+        let dot = 0;
+        const base = meta.offset + c * inDim * 4;
+        for (let i = 0; i < inDim; i++) {
+            dot += input[i] * dv.getFloat32(base + i * 4, true);
+        }
+        output[c] = dot;
+    }
+    return output;
+}
+
+// Generic matmul dispatcher (handles all tensor types)
+function matmulGeneric(meta, input) {
+    switch (meta.type) {
+        case 0:  return matmulF32xF32(meta, input);
+        case 8:  return matmulQ80xF32(meta, input);
+        case 10: return matmulQ2KxF32(meta, input);
+        case 11: return matmulQ3KxF32(meta, input);
+        case 12: return matmulQ4KxF32(meta, input);
+        case 13: return matmulQ5KxF32(meta, input);
+        case 14: return matmulQ6KxF32(meta, input);
+        default: throw new Error(`Unsupported tensor type for matmul: ${meta.type}`);
+    }
+}
+
+// Generic embedding lookup (row = token ID, one column of the transposed matrix)
+function embeddingLookupGeneric(meta, tokenId) {
+    const outDim = meta.shape[0];
+    switch (meta.type) {
+        case 8: return embeddingLookupQ80(meta, tokenId);
+        case 0: {
+            const out = new Float32Array(outDim);
+            const dv = new DataView(meta.buffer);
+            const base = meta.offset + tokenId * outDim * 4;
+            for (let i = 0; i < outDim; i++) out[i] = dv.getFloat32(base + i * 4, true);
+            return out;
+        }
+        // For k-quants, treat as column lookup (column = tokenId)
+        case 10: case 11: case 12: case 13: case 14: {
+            const fakeMeta = { ...meta, shape: [outDim, meta.shape[1]] };
+            const oneHot = new Float32Array(1);
+            oneHot[0] = 1;
+            // Simpler: decode the single column
+            const input = new Float32Array(outDim);
+            // Use matmulGeneric on a single column by constructing a 1-element tensor
+            // Actually: just iterate through the block for column tokenId
+            return _lookupKQuantColumn(meta, tokenId);
+        }
+        default: throw new Error(`Unsupported embedding type: ${meta.type}`);
+    }
+}
+
+function _lookupKQuantColumn(meta, colIdx) {
+    const outDim = meta.shape[0];
+    // Build a 1D "matmul" with a 1-element output by selecting one column
+    const colMeta = {
+        buffer: meta.buffer,
+        offset: meta.offset,
+        nbytes: meta.nbytes,
+        shape: [outDim, 1],  // treat as single-column matrix
+        type: meta.type,
+    };
+    // input is a 1-element vector selecting the colIdx-th column... actually embedding lookup is
+    // selecting row tokenId from the weight matrix [vocab × embd], so we need the tokenId-th column
+    // since GGUF stores it as [embd, vocab] (column-major, each vocab-token is a column)
+    const tmp = new Float32Array(1);
+    tmp[0] = 1;
+    // We need to bypass matmulGeneric and read the column directly
+    switch (meta.type) {
+        case 10: return _q2kColumn(meta, colIdx, outDim);
+        case 11: return _q3kColumn(meta, colIdx, outDim);
+        case 12: return _q4kColumn(meta, colIdx, outDim);
+        case 13: return _q5kColumn(meta, colIdx, outDim);
+        case 14: return _q6kColumn(meta, colIdx, outDim);
+        default: return new Float32Array(outDim);
+    }
+}
+
+function _q2kColumn(meta, colIdx, outDim) {
+    const blocksPerCol = Math.ceil(outDim / QK_K);
+    const u8 = new Uint8Array(meta.buffer);
+    const dv = new DataView(meta.buffer);
+    const out = new Float32Array(outDim);
+    const colBase = meta.offset + colIdx * blocksPerCol * BLOCK_SIZE_Q2_K;
+    let outIdx = 0;
+    for (let b = 0; b < blocksPerCol && outIdx < outDim; b++) {
+        const bb = colBase + b * BLOCK_SIZE_Q2_K;
+        const d = dv.getFloat16(bb, true);
+        const dmin = dv.getFloat16(bb + 2, true);
+        const maxElem = Math.min(QK_K, outDim - outIdx);
+        for (let e = 0; e < maxElem; e++, outIdx++) {
+            const sub = e >> 4;
+            const scaleByte = u8[bb + 4 + sub];
+            const q = (u8[bb + 20 + (e >> 2)] >> ((e & 3) << 1)) & 0x3;
+            out[outIdx] = d * (scaleByte & 0xF) * q - dmin * ((scaleByte >> 4) & 0xF);
+        }
+    }
+    return out;
+}
+
+// (Similar column readers for Q3K–Q6K omitted for brevity; they follow the same pattern)
+function _q3kColumn(meta, colIdx, outDim) {
+    const blocksPerCol = Math.ceil(outDim / QK_K);
+    const u8 = new Uint8Array(meta.buffer);
+    const dv = new DataView(meta.buffer);
+    const out = new Float32Array(outDim);
+    const colBase = meta.offset + colIdx * blocksPerCol * BLOCK_SIZE_Q3_K;
+    let outIdx = 0;
+    for (let b = 0; b < blocksPerCol && outIdx < outDim; b++) {
+        const bb = colBase + b * BLOCK_SIZE_Q3_K;
+        const d = dv.getFloat16(bb + 108, true);
+        const maxElem = Math.min(QK_K, outDim - outIdx);
+        for (let e = 0; e < maxElem; e++, outIdx++) {
+            const scale = _q3kGetScale(u8, bb + 96, e >> 4);
+            const hmaskBit = (u8[bb + (e >> 3)] >> (e & 7)) & 1;
+            const low2 = (u8[bb + 32 + (e >> 2)] >> ((e & 3) << 1)) & 3;
+            out[outIdx] = d * scale * ((low2 | (hmaskBit << 2)) - 4);
+        }
+    }
+    return out;
+}
+function _q4kColumn(meta, colIdx, outDim) {
+    const blocksPerCol = Math.ceil(outDim / QK_K);
+    const u8 = new Uint8Array(meta.buffer);
+    const dv = new DataView(meta.buffer);
+    const out = new Float32Array(outDim);
+    const colBase = meta.offset + colIdx * blocksPerCol * BLOCK_SIZE_Q4_K;
+    let outIdx = 0;
+    for (let b = 0; b < blocksPerCol && outIdx < outDim; b++) {
+        const bb = colBase + b * BLOCK_SIZE_Q4_K;
+        const d = dv.getFloat16(bb, true), dmin = dv.getFloat16(bb + 2, true);
+        const maxElem = Math.min(QK_K, outDim - outIdx);
+        for (let e = 0; e < maxElem; e++, outIdx++) {
+            const [sc, mn] = _q4kGetScaleMin(u8, bb + 4, e >> 5);
+            const qsByte = u8[bb + 16 + (e >> 1)];
+            const q4 = e & 1 ? (qsByte >> 4) & 0xF : qsByte & 0xF;
+            out[outIdx] = d * sc * q4 - dmin * mn;
+        }
+    }
+    return out;
+}
+function _q5kColumn(meta, colIdx, outDim) {
+    const blocksPerCol = Math.ceil(outDim / QK_K);
+    const u8 = new Uint8Array(meta.buffer);
+    const dv = new DataView(meta.buffer);
+    const out = new Float32Array(outDim);
+    const colBase = meta.offset + colIdx * blocksPerCol * BLOCK_SIZE_Q5_K;
+    let outIdx = 0;
+    for (let b = 0; b < blocksPerCol && outIdx < outDim; b++) {
+        const bb = colBase + b * BLOCK_SIZE_Q5_K;
+        const d = dv.getFloat16(bb, true), dmin = dv.getFloat16(bb + 2, true);
+        const maxElem = Math.min(QK_K, outDim - outIdx);
+        for (let e = 0; e < maxElem; e++, outIdx++) {
+            const [sc, mn] = _q4kGetScaleMin(u8, bb + 4, e >> 5);
+            const highBit = (u8[bb + 16 + (e >> 3)] >> (e & 7)) & 1;
+            const qsByte = u8[bb + 48 + (e >> 1)];
+            const low4 = e & 1 ? (qsByte >> 4) & 0xF : qsByte & 0xF;
+            out[outIdx] = d * sc * (low4 | (highBit << 4)) - dmin * mn;
+        }
+    }
+    return out;
+}
+function _q6kColumn(meta, colIdx, outDim) {
+    const blocksPerCol = Math.ceil(outDim / QK_K);
+    const u8 = new Uint8Array(meta.buffer);
+    const dv = new DataView(meta.buffer);
+    const out = new Float32Array(outDim);
+    const colBase = meta.offset + colIdx * blocksPerCol * BLOCK_SIZE_Q6_K;
+    let outIdx = 0;
+    for (let b = 0; b < blocksPerCol && outIdx < outDim; b++) {
+        const bb = colBase + b * BLOCK_SIZE_Q6_K;
+        const d = dv.getFloat16(bb + 208, true);
+        const maxElem = Math.min(QK_K, outDim - outIdx);
+        for (let e = 0; e < maxElem; e++, outIdx++) {
+            const scaleByte = u8[bb + 192 + (e >> 4)];
+            const scale = scaleByte >= 128 ? scaleByte - 256 : scaleByte;
+            const low4 = e & 1 ? (u8[bb + (e >> 1)] >> 4) & 0xF : u8[bb + (e >> 1)] & 0xF;
+            const high2 = (u8[bb + 128 + (e >> 2)] >> ((e & 3) << 1)) & 0x3;
+            out[outIdx] = d * scale * ((low4 | (high2 << 4)) - 32);
+        }
+    }
+    return out;
+}
+
 // --- Logits from Q8_0 weight [emb_dim, n_vocab], GGUF column-major ---
 function logitsFromQ80(meta, hidden) {
     const embDim  = meta.shape[0];   // column length (fastest-varying)
