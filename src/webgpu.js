@@ -235,14 +235,20 @@ fn add_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= n) { return; }
     a[i] += b[i];
-}
+}`;
 
-// a += scale * b  (axpy)
+// a += scale * b  (used for MoE expert accumulation — all on GPU, no CPU roundtrip)
+const WGSL_AXPY = /* wgsl */`
+struct P { n: u32, scale: f32 }
+@group(0) @binding(0) var<storage, read_write> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<uniform> p: P;
+
 @compute @workgroup_size(256)
-fn axpy(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= n) { return; }
-    a[i] += b[i];  // scale passed via b being pre-scaled on CPU
+    if (i >= p.n) { return; }
+    a[i] += p.scale * b[i];
 }`;
 
 // GQA decode attention — one workgroup per query head
@@ -496,7 +502,7 @@ class Qwen3GPUEngine {
 
         // Create pipelines (async — surfaces WGSL compile errors with line numbers)
         console.log('[GPU] Compiling shaders...');
-        const [matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy, attention] = await Promise.all([
+        const [matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy, attention, axpy] = await Promise.all([
             eng._gpu.getOrCreatePipeline('matmul_q8_0',  WGSL_MATMUL_Q8_0),
             eng._gpu.getOrCreatePipeline('matmul_kquant', WGSL_MATMUL_KQUANT),
             eng._gpu.getOrCreatePipeline('rmsnorm',       WGSL_RMSNORM),
@@ -505,8 +511,9 @@ class Qwen3GPUEngine {
             eng._gpu.getOrCreatePipeline('add_residual',  WGSL_ELEMENTWISE, 'add_residual'),
             eng._gpu.getOrCreatePipeline('copy',          WGSL_COPY),
             eng._gpu.getOrCreatePipeline('attention',     WGSL_ATTENTION),
+            eng._gpu.getOrCreatePipeline('axpy',          WGSL_AXPY),
         ]);
-        eng._pipelines = { matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy, attention };
+        eng._pipelines = { matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy, attention, axpy };
         console.log('[GPU] Shaders compiled OK.');
 
         // Upload weight tensors to GPU
@@ -666,6 +673,19 @@ class Qwen3GPUEngine {
         const g = this._gpu;
         const uBuf = g.createUniformBuffer(new Uint32Array([n]));
         g.dispatch(this._pipelines.addResidual,
+            [g.buf(aBuf), g.buf(bBuf), g.ubuf(uBuf)],
+            Math.ceil(n / 256));
+        uBuf.destroy();
+    }
+
+    // ---- GPU helper: a += scale * b  (MoE expert accumulation, fully on GPU) ----
+    _axpy(aBuf, bBuf, n, scale) {
+        const g = this._gpu;
+        const params = new ArrayBuffer(8);
+        new Uint32Array(params)[0] = n;
+        new Float32Array(params)[1] = scale;
+        const uBuf = g.createUniformBuffer(params);
+        g.dispatch(this._pipelines.axpy,
             [g.buf(aBuf), g.buf(bBuf), g.ubuf(uBuf)],
             Math.ceil(n / 256));
         uBuf.destroy();
@@ -856,14 +876,8 @@ class Qwen3GPUEngine {
             // down = matmul(gate, down_exps_expert)
             this._matmulSlice(downSlice.buf, downSlice.offset, this._buf.gate, this._buf.down, cl.ffnDownExps, this.nEmb, hidDim);
 
-            // Accumulate: moeAcc += w * down (scale on CPU by pre-scaling the readback)
-            // For simplicity, read back and accumulate on CPU
-            const downCPU = await g.readF32(this._buf.down, this.nEmb);
-            // Write weighted version back into a temp and add
-            const scaled = new Float32Array(this.nEmb);
-            for (let i = 0; i < this.nEmb; i++) scaled[i] = w * downCPU[i];
-            g.device.queue.writeBuffer(this._buf.down, 0, scaled);
-            this._addResidual(this._buf.moeAcc, this._buf.down, this.nEmb);
+            // Accumulate: moeAcc += w * down — fully on GPU, no CPU roundtrip
+            this._axpy(this._buf.moeAcc, this._buf.down, this.nEmb, w);
         }
 
         // Add MoE output to hidden

@@ -35,7 +35,8 @@ body { font-family: 'Segoe UI', sans-serif; background:#0d1117; color:#c9d1d9; d
 .token-item.selected { background:#1f3a5f; border-color:#1f6feb; }
 .token-item .tok-id { color:#8b949e; font-size:0.78em; }
 
-#controls { padding:8px; border-top:1px solid #30363d; font-size:0.8em; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+#controls { padding:6px 8px; border-top:1px solid #30363d; font-size:0.8em; display:flex; flex-direction:column; gap:6px; }
+#controls .ctrl-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
 #controls label { display:flex; align-items:center; gap:4px; }
 
 /* --- Right panel --- */
@@ -85,8 +86,20 @@ body { font-family: 'Segoe UI', sans-serif; background:#0d1117; color:#c9d1d9; d
       <div id="tokenItems"></div>
     </div>
     <div id="controls">
-      <label>Max: <input type="number" id="maxTokens" value="64" min="1" max="512" style="width:55px; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px 4px; border-radius:3px;"></label>
-      <label>Temp: <input type="number" id="tempInput" value="0.7" min="0" max="2" step="0.1" style="width:50px; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px 4px; border-radius:3px;"></label>
+      <div class="ctrl-row">
+        <label>Max: <input type="number" id="maxTokens" value="64" min="1" max="512" style="width:55px; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px 4px; border-radius:3px;"></label>
+        <label>Temp: <input type="number" id="tempInput" value="0.7" min="0" max="2" step="0.1" style="width:50px; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px 4px; border-radius:3px;"></label>
+      </div>
+      <div class="ctrl-row">
+        <span style="color:#8b949e;">表示:</span>
+        <button id="modeSnap"  class="btn active" onclick="setMode('snapshot')">📸 スナップ</button>
+        <button id="modeDecay" class="btn"        onclick="setMode('decay')">🔥 Decay</button>
+        <button id="modeCumul" class="btn"        onclick="setMode('cumul')">📊 累積</button>
+        <label id="decayLabel" style="display:none;">
+          減衰: <input type="range" id="glowDecaySlider" min="0.5" max="0.95" step="0.05" value="0.75" style="width:65px; vertical-align:middle;">
+          <span id="glowDecayVal">0.75</span>
+        </label>
+      </div>
     </div>
   </div>
 
@@ -136,6 +149,12 @@ let isGenerating = false;
 let startTime = 0;
 let tokenCount = 0;
 let nExpertsTotal = 0;
+
+// View mode: 'snapshot' | 'decay' | 'cumul'
+let viewMode = 'snapshot';
+let glowMap = {};   // glowMap[layerIdx] = Float32Array(nExperts)  — decay用
+let glowDecay = 0.75;
+let cumulMap = {};  // cumulMap[layerIdx] = Int32Array(nExperts)   — cumul用
 
 const LABEL_W = 28;  // space for layer number labels on left
 let lastCellW = 1, lastCellH = 1;  // updated each draw, reused by event handlers
@@ -204,6 +223,8 @@ function resetViz() {
     prefillDone = false;
     selectedTokenIdx = -1;
     tokenCount = 0;
+    glowMap = {};
+    cumulMap = {};
     document.getElementById('tokenItems').innerHTML = '';
     document.getElementById('tokenCount').textContent = '0';
     document.getElementById('vizTitle').textContent =
@@ -253,6 +274,20 @@ async function startGeneration() {
             const idx = tokenCount;
             routerData[idx] = { ...pendingRouterUpdates };
             pendingRouterUpdates = {};
+
+            // Update decay (EMA) and cumulative maps
+            const boost = 1 - glowDecay;
+            for (const [layerIdxStr, {selected}] of Object.entries(routerData[idx])) {
+                const li = Number(layerIdxStr);
+                // decay
+                if (!glowMap[li]) glowMap[li] = new Float32Array(nExpertsTotal);
+                const g = glowMap[li];
+                for (let e = 0; e < nExpertsTotal; e++) g[e] *= glowDecay;
+                for (const ei of selected) g[ei] = Math.min(1.0, g[ei] + boost);
+                // cumul
+                if (!cumulMap[li]) cumulMap[li] = new Int32Array(nExpertsTotal);
+                for (const ei of selected) cumulMap[li][ei]++;
+            }
 
             tokenCount++;
             document.getElementById('tokenCount').textContent = tokenCount;
@@ -333,19 +368,53 @@ function drawAllLayers(tokenIdx) {
             ctx.fillText(`${layerIdx}`, 0, li * cellH + cellH - 2);
         }
 
+        // Pre-compute cumul layer max (used when mode === 'cumul')
+        const cumulLayer = cumulMap[layerIdx];
+        const cumulMax = cumulLayer ? Math.max(...cumulLayer) : 0;
+
         probs.forEach((p, ei) => {
-            const intensity = maxP > 0 ? p / maxP : 0;
-            const isSelected = selected && selected.includes(ei);
-            if (isSelected) {
-                const v = Math.round(80 + 175 * intensity);
-                ctx.fillStyle = `rgb(255,${v},0)`;
-            } else if (intensity > 0.01) {
-                const b = Math.round(80 + 150 * intensity);
-                ctx.fillStyle = `rgb(20,50,${b})`;
-            } else {
-                ctx.fillStyle = '#0d1117';
-            }
             const gap = cellW > 2 ? 1 : 0;
+            let color;
+
+            if (viewMode === 'snapshot') {
+                // --- 既存のスナップショット表示 ---
+                const intensity = maxP > 0 ? p / maxP : 0;
+                const isSelected = selected && selected.includes(ei);
+                if (isSelected) {
+                    color = `rgb(255,${Math.round(80 + 175 * intensity)},0)`;
+                } else if (intensity > 0.01) {
+                    color = `rgb(20,50,${Math.round(80 + 150 * intensity)})`;
+                } else {
+                    color = '#0d1117';
+                }
+
+            } else if (viewMode === 'decay') {
+                // --- Accumulating EMA 残像 ---
+                const glow = glowMap[layerIdx]?.[ei] ?? 0;
+                const isSelected = selected && selected.includes(ei);
+                if (isSelected) {
+                    // 現在選択中: 明るいオレンジ
+                    const v = Math.round(80 + 175 * (maxP > 0 ? p / maxP : 0));
+                    color = `rgb(255,${v},0)`;
+                } else if (glow > 0.03) {
+                    // 残像: 暗赤〜オレンジ
+                    color = `rgb(${Math.round(60 + 195 * glow)},${Math.round(15 * glow)},0)`;
+                } else {
+                    color = '#0d1117';
+                }
+
+            } else {
+                // --- 累積ヒートマップ ---
+                const count = cumulLayer ? cumulLayer[ei] : 0;
+                const intensity = cumulMax > 0 ? count / cumulMax : 0;
+                if (intensity > 0) {
+                    color = `rgb(${Math.round(30 + 225 * intensity)},${Math.round(10 * intensity)},0)`;
+                } else {
+                    color = '#0d1117';
+                }
+            }
+
+            ctx.fillStyle = color;
             ctx.fillRect(LABEL_W + ei * cellW, li * cellH, cellW - gap, cellH - gap);
         });
     });
@@ -443,6 +512,20 @@ function renderBreakpoints() {
         list.appendChild(chip);
     });
 }
+
+function setMode(m) {
+    viewMode = m;
+    document.getElementById('modeSnap').className  = 'btn' + (m === 'snapshot' ? ' active' : '');
+    document.getElementById('modeDecay').className = 'btn' + (m === 'decay'    ? ' active' : '');
+    document.getElementById('modeCumul').className = 'btn' + (m === 'cumul'    ? ' active' : '');
+    document.getElementById('decayLabel').style.display = m === 'decay' ? '' : 'none';
+    if (selectedTokenIdx >= 0) drawAllLayers(selectedTokenIdx);
+}
+
+document.getElementById('glowDecaySlider').addEventListener('input', (e) => {
+    glowDecay = parseFloat(e.target.value);
+    document.getElementById('glowDecayVal').textContent = glowDecay.toFixed(2);
+});
 
 function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
