@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<title>Qwen3 Chat</title>
+<title>LLM Chat</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; }
@@ -53,7 +53,7 @@ body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
 <body>
 
 <div id="header">
-    <h1>Qwen3 Chat</h1>
+    <h1 id="appTitle">LLM Chat</h1>
     <button class="btn" onclick="document.getElementById('fileInput').click()">📂 GGUF読み込み</button>
     <input type="file" id="fileInput" accept=".gguf">
     <div id="progressBar"><div id="progressFill"></div></div>
@@ -85,6 +85,7 @@ body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
 <script src="../src/tensor.js"></script>
 <script src="../src/kv-cache.js"></script>
 <script src="../src/qwen3-engine.js"></script>
+<script src="../src/lfm2-engine.js"></script>
 <script src="../src/webgpu.js"></script>
 
 <script>
@@ -115,21 +116,41 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
         });
         progressFill.style.width = '93%';
 
-        // Try GPU engine first, fall back to CPU
+        // Detect architecture and choose engine
+        const archName = gguf.getKeyValue('general.architecture', '');
+        const isLfm2   = archName === 'lfm2moe' || archName === 'lfm2';
+        const arch     = gguf.getArch();
+
         let gpuLabel = '';
-        try {
-            engine = await Qwen3GPUEngine.create(gguf);
-            gpuLabel = ' | ⚡ WebGPU';
-        } catch (gpuErr) {
-            console.warn('[GPU] Unavailable, falling back to CPU:', gpuErr.message);
-            engine = new Qwen3Engine(gguf);
-            gpuLabel = ' | CPU';
+        if (isLfm2) {
+            // LFM2: try GPU first, fall back to CPU
+            try {
+                engine   = await Lfm2GPUEngine.create(gguf);
+                gpuLabel = ' | ⚡ WebGPU';
+            } catch (gpuErr) {
+                console.warn('[GPU-LFM2] Unavailable, falling back to CPU:', gpuErr.message);
+                engine   = new Lfm2Engine(gguf);
+                gpuLabel = ' | CPU';
+            }
+            document.getElementById('appTitle').textContent = 'LFM2 Chat';
+        } else {
+            // Qwen3 / Qwen3-MoE: try GPU first, fall back to CPU
+            try {
+                engine   = await Qwen3GPUEngine.create(gguf);
+                gpuLabel = ' | ⚡ WebGPU';
+            } catch (gpuErr) {
+                console.warn('[GPU] Unavailable, falling back to CPU:', gpuErr.message);
+                engine   = new Qwen3Engine(gguf);
+                gpuLabel = ' | CPU';
+            }
+            document.getElementById('appTitle').textContent = 'Qwen3 Chat';
         }
         progressFill.style.width = '100%';
 
-        const arch = gguf.getArch();
         const moeLabel = engine.isMoE ? ' MoE' : '';
-        statusEl.textContent = `${gguf.getKeyValue('general.name', file.name)} | ${arch.blockCount}L ${arch.embeddingLength}d${moeLabel}${gpuLabel} | 準備OK`;
+        // For LFM2, show hybrid layer info
+        const hybridLabel = isLfm2 ? ` (${arch.shortconvLCache > 0 ? '18conv+6attn' : 'hybrid'})` : '';
+        statusEl.textContent = `${gguf.getKeyValue('general.name', file.name)} | ${arch.blockCount}L ${arch.embeddingLength}d${moeLabel}${hybridLabel}${gpuLabel} | 準備OK`;
         statusEl.className = 'ready';
 
         document.getElementById('messageInput').disabled = false;
@@ -248,6 +269,8 @@ async function sendMessage() {
     let tokenCount = 0;
     const generatedTokenIds = [];
 
+    const statsBar = document.getElementById('statsBar');
+
     try {
         await engine.generate(tokenIds, {
             maxSteps: parseInt(document.getElementById('maxTokensInput').value) || 512,
@@ -255,6 +278,12 @@ async function sendMessage() {
             topP: parseFloat(document.getElementById('topPSlider').value),
             topK: parseInt(document.getElementById('topKInput').value) || 40,
             abortSignal: currentAbort.signal,
+            onPrefill(done, total) {
+                if (total <= 1) return;
+                const pct = Math.round(done / total * 100);
+                statsBar.textContent = `⏳ prefill中... ${done}/${total} tokens (${pct}%)`;
+                statsBar.className = 'visible';
+            },
             onToken(tokenId) {
                 tokenCount++;
                 const now = ((performance.now() - startTime) / 1000).toFixed(2);
@@ -283,7 +312,6 @@ async function sendMessage() {
 
     console.log(`[PERF] total=${elapsed}s, tokens=${tokenCount}, ${tps} tok/s`);
 
-    const statsBar = document.getElementById('statsBar');
     statsBar.textContent = `⚡ ${tokenCount} tokens / ${elapsed}s (${tps} tok/s)`;
     statsBar.className = 'visible';
 

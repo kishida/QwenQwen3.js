@@ -131,11 +131,14 @@ body { font-family: 'Segoe UI', sans-serif; background:#0d1117; color:#c9d1d9; d
 <script src="../src/tensor.js"></script>
 <script src="../src/kv-cache.js"></script>
 <script src="../src/qwen3-engine.js"></script>
+<script src="../src/lfm2-engine.js"></script>
 <script src="../src/webgpu.js"></script>
 
 <script>
 let engine = null;
 let useGPU = true;
+let isLfm2 = false;        // true when LFM2 model is loaded
+let layerInfoMap = {};     // layerIdx → { isRecurrent, isMoE, isDense } for LFM2 display
 
 // routerData[outputTokenIdx][layerIdx] = { probs, selected }
 let routerData = [];
@@ -185,7 +188,23 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
             progressFill.style.width = `${progress * 90}%`;
         });
         progressFill.style.width = '95%';
-        if (useGPU) {
+        const archName = gguf.getKeyValue('general.architecture', '');
+        isLfm2 = archName === 'lfm2moe' || archName === 'lfm2';
+
+        if (isLfm2) {
+            // Try GPU first, CPU fallback
+            try {
+                engine = await Lfm2GPUEngine.create(gguf);
+                status.textContent = `[GPU/LFM2] ${gguf.getKeyValue('general.name', file.name)}`;
+            } catch (gpuErr) {
+                console.warn('[GPU-LFM2] Unavailable, CPU fallback:', gpuErr.message);
+                engine = new Lfm2Engine(gguf);
+                status.textContent = `[CPU/LFM2] ${gguf.getKeyValue('general.name', file.name)}`;
+            }
+            // Build layer info map for visualization (same for both CPU and GPU engine)
+            layerInfoMap = {};
+            engine.layers.forEach((l, i) => { layerInfoMap[i] = l; });
+        } else if (useGPU) {
             try {
                 engine = await Qwen3GPUEngine.create(gguf);
                 status.textContent = `[GPU] ${gguf.getKeyValue('general.name', file.name)}`;
@@ -201,7 +220,11 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
         progressFill.style.width = '100%';
         setTimeout(() => { progressBar.style.display = 'none'; }, 500);
         status.className = 'ready';
-        nExpertsTotal = engine.isMoE ? (engine.layers.find(l => l.isMoE)?.nExperts || 128) : 0;
+        if (isLfm2) {
+            nExpertsTotal = engine.nExperts || 32;
+        } else {
+            nExpertsTotal = engine.isMoE ? (engine.layers.find(l => l.isMoE)?.nExperts || 128) : 0;
+        }
         document.getElementById('genBtn').disabled = false;
         resetViz();
     } catch (err) {
@@ -252,9 +275,12 @@ async function startGeneration() {
 
     // Router callback: accumulate per-forward-pass, ignore prefill
     engine.onRouterUpdate = (data) => {
-        if (!prefillDone) {
-            // During prefill: keep overwriting so only the last prompt token's data
-            // remains in pending when the first onToken fires
+        // CPU mode (batchRouterUpdate=false/undefined): each layer fires synchronously
+        //   during forward(), so reset at the start of each new forward pass (prefill)
+        //   to keep only the last prefill token's data.
+        // GPU batch mode (batchRouterUpdate=true): all layers are batch-read AFTER the
+        //   forward pass, before onToken. Never reset here — all MoE layers must accumulate.
+        if (!prefillDone && !engine.batchRouterUpdate) {
             pendingRouterUpdates = {};
         }
         pendingRouterUpdates[data.layer] = {
@@ -268,6 +294,12 @@ async function startGeneration() {
         temperature,
         topP: 0.9,
         topK: 40,
+        onPrefill: (done, total) => {
+            if (total <= 1) return;
+            const pct = Math.round(done / total * 100);
+            document.getElementById('statTPS').textContent =
+                `⏳ prefill中... ${done}/${total} (${pct}%)`;
+        },
         onToken: (tokenId) => {
             // First onToken means prefill is done; commit the pending router data
             prefillDone = true;
@@ -362,10 +394,19 @@ function drawAllLayers(tokenIdx) {
         const { probs, selected } = data[layerIdx];
         const maxP = Math.max(...probs);
 
+        // --- LFM2: layer type badge in label column ---
+        const linfo = layerInfoMap[layerIdx];
+        let labelColor = '#6e7681';
+        let labelSuffix = '';
+        if (linfo) {
+            if (linfo.isRecurrent) { labelColor = '#388bfd'; labelSuffix = '~'; }  // conv: blue ~
+            else                   { labelColor = '#3fb950'; labelSuffix = 'A'; }  // attn: green A
+        }
+
         if (showLabel) {
-            ctx.fillStyle = '#6e7681';
+            ctx.fillStyle = labelColor;
             ctx.font = `${Math.min(cellH - 2, 11)}px monospace`;
-            ctx.fillText(`${layerIdx}`, 0, li * cellH + cellH - 2);
+            ctx.fillText(`${layerIdx}${labelSuffix}`, 0, li * cellH + cellH - 2);
         }
 
         // Pre-compute cumul layer max (used when mode === 'cumul')
@@ -377,7 +418,7 @@ function drawAllLayers(tokenIdx) {
             let color;
 
             if (viewMode === 'snapshot') {
-                // --- 既存のスナップショット表示 ---
+                // --- スナップショット表示 ---
                 const intensity = maxP > 0 ? p / maxP : 0;
                 const isSelected = selected && selected.includes(ei);
                 if (isSelected) {
@@ -393,11 +434,9 @@ function drawAllLayers(tokenIdx) {
                 const glow = glowMap[layerIdx]?.[ei] ?? 0;
                 const isSelected = selected && selected.includes(ei);
                 if (isSelected) {
-                    // 現在選択中: 明るいオレンジ
                     const v = Math.round(80 + 175 * (maxP > 0 ? p / maxP : 0));
                     color = `rgb(255,${v},0)`;
                 } else if (glow > 0.03) {
-                    // 残像: 暗赤〜オレンジ
                     color = `rgb(${Math.round(60 + 195 * glow)},${Math.round(15 * glow)},0)`;
                 } else {
                     color = '#0d1117';
@@ -419,8 +458,9 @@ function drawAllLayers(tokenIdx) {
         });
     });
 
+    const modelLabel = isLfm2 ? 'LFM2 (🔵conv ~  🟢attn A)' : 'Qwen3';
     document.getElementById('vizTitle').textContent =
-        `Expert活性化マップ — トークン ${tokenIdx}（${nLayers} MoEレイヤー × ${nExperts} Expert）`;
+        `${modelLabel} Expert活性化マップ — トークン ${tokenIdx}（${nLayers} MoEレイヤー × ${nExperts} Expert）`;
 }
 
 // --- Canvas tooltip ---

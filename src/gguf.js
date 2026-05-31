@@ -264,17 +264,29 @@ class GGUFReader {
     getArch() {
         const arch = this.getKeyValue('general.architecture', 'unknown');
         const prefix = arch + '.';
+
+        // head_count_kv may be a scalar or per-layer array (LFM2 stores 0 for recurrent layers)
+        const headCountKVRaw = this.getKeyValue(prefix + 'attention.head_count_kv');
+        const headCountKV = Array.isArray(headCountKVRaw)
+            ? Math.max(...headCountKVRaw.filter(v => v > 0))
+            : Number(headCountKVRaw);
+
         return {
             architecture: arch,
-            vocabSize: Number(this.getKeyValue(prefix + 'vocab_size')),
-            contextLength: Number(this.getKeyValue(prefix + 'context_length')),
-            embeddingLength: Number(this.getKeyValue(prefix + 'embedding_length')),
-            blockCount: Number(this.getKeyValue(prefix + 'block_count')),
-            feedForwardLength: Number(this.getKeyValue(prefix + 'feed_forward_length')),
-            headCount: Number(this.getKeyValue(prefix + 'attention.head_count')),
-            headCountKV: Number(this.getKeyValue(prefix + 'attention.head_count_kv')),
-            layerNormRmsEps: this.getKeyValue(prefix + 'attention.layer_norm_rms_epsilon'),
-            ropeFreqBase: Number(this.getKeyValue(prefix + 'rope.freq_base') || this.getKeyValue(prefix + 'rope_freq_base')),
+            vocabSize:           Number(this.getKeyValue(prefix + 'vocab_size')),
+            contextLength:       Number(this.getKeyValue(prefix + 'context_length')),
+            embeddingLength:     Number(this.getKeyValue(prefix + 'embedding_length')),
+            blockCount:          Number(this.getKeyValue(prefix + 'block_count')),
+            feedForwardLength:   Number(this.getKeyValue(prefix + 'feed_forward_length')),
+            headCount:           Number(this.getKeyValue(prefix + 'attention.head_count')),
+            headCountKV,
+            layerNormRmsEps:     this.getKeyValue(prefix + 'attention.layer_norm_rms_epsilon'),
+            ropeFreqBase:        Number(this.getKeyValue(prefix + 'rope.freq_base') || this.getKeyValue(prefix + 'rope_freq_base')),
+            // LFM2-specific fields (undefined for other architectures)
+            expertFeedForwardLength: Number(this.getKeyValue(prefix + 'expert_feed_forward_length')) || 0,
+            leadingDenseBlockCount:  Number(this.getKeyValue(prefix + 'leading_dense_block_count'))  || 0,
+            expertGatingFunc:        Number(this.getKeyValue(prefix + 'expert_gating_func'))          || 0,
+            shortconvLCache:         Number(this.getKeyValue(prefix + 'shortconv.l_cache'))           || 0,
         };
     }
 

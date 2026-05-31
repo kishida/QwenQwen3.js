@@ -92,7 +92,10 @@ fileInput.addEventListener('change', async (e) => {
     statusEl.textContent = 'ファイル読み込み中...';
 
     try {
-        const buffer = await file.arrayBuffer();
+        // Read only the first 64MB (header + KV pairs) — tokenizer doesn't need tensor data
+        const HEADER_MAX = 64 * 1024 * 1024;
+        const headerSlice = file.slice(0, Math.min(HEADER_MAX, file.size));
+        const buffer = await headerSlice.arrayBuffer();
         progressFill.style.width = '40%';
 
         ggufReader = new GGUFReader(buffer);

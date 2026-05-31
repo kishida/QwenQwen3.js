@@ -1,13 +1,16 @@
-// === 特殊トークン定義（必要に応じて差し替え） ===
-const SPECIAL_TOKENS = [
-    '<|im_start|>',   // role開始マーカー
-    '<|im_end|>',     // role終了マーカー
-    '<think>',      // thinking開始
-    '</think>',     // thinking終了
+// === フォールバック用ハードコード特殊トークン ===
+// GGUF に token_type が無い場合や追加で必ず処理したいトークン
+const FALLBACK_SPECIAL_TOKENS = [
+    '<|im_start|>',
+    '<|im_end|>',
+    '<think>',
+    '</think>',
 ];
 
-// 正規表現エスケープ済みパターン（pretokenize で使用）
-const SPECIAL_TOKEN_PATTERN = SPECIAL_TOKENS.map(t => t.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')).join('|');
+// 正規表現エスケープ用ヘルパー
+function _escapeRegex(s) {
+    return s.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&');
+}
 
 class BPETokenizer {
     constructor() {
@@ -20,8 +23,10 @@ class BPETokenizer {
         this.eosTokenId = -1;
         this.isQwen35 = false;
 
-        this.specialTokenIds = new Map();
+        this.specialTokenIds = new Map();   // string → id (lookup-by-string)
+        this.specialTokenSet = new Set();   // set of ALL special token strings (for bpeTokenize guard)
         this.stopTokenIds = new Set();
+        this._specialTokenPattern = '';     // regex alternation built from specialTokenSet
     }
 
     loadFromGGUF(gguf) {
@@ -41,12 +46,20 @@ class BPETokenizer {
         this.bosTokenId = Number(gguf.getKeyValue('tokenizer.ggml.bos_token_id', -1));
         this.eosTokenId = Number(gguf.getKeyValue('tokenizer.ggml.eos_token_id', -1));
 
+        // token_type 配列を先に読む（type=3 が control/special トークン）
+        const tokenTypes = gguf.getKeyValue('tokenizer.ggml.token_type');
+
         for (let i = 0; i < tokensArr.length; i++) {
             const tok = tokensArr[i];
             this.tokenToId.set(tok, i);
             this.idToToken[i] = tok;
             if (tok.length === 1) {
                 this.cptToToken.set(tok.codePointAt(0), i);
+            }
+            // token_type = 3 → control/special: 必ず specialTokenSet に追加
+            if (tokenTypes && tokenTypes[i] === 3) {
+                this.specialTokenSet.add(tok);
+                this.specialTokenIds.set(tok, i);
             }
         }
 
@@ -58,34 +71,57 @@ class BPETokenizer {
             this.bpeRanks.set(merge.substring(0, sp) + '\x00' + merge.substring(sp + 1), i);
         }
 
-        // 特殊トークンのIDをキャッシュ（vocab読み込み後）
-        for (const tok of SPECIAL_TOKENS) {
+        // フォールバック: GGUF に token_type が無い場合などのためハードコードリストも確認
+        for (const tok of FALLBACK_SPECIAL_TOKENS) {
             const id = this.tokenToId.get(tok);
             if (id !== undefined) {
                 this.specialTokenIds.set(tok, id);
-            } else {
-                console.warn(`[Tokenizer] Special token not found in vocab: ${tok}`);
+                this.specialTokenSet.add(tok);
             }
         }
 
-        // 終了判定用：im_end のみで生成停止
-        const imEndTok = SPECIAL_TOKENS[1]; // im_end
-        const id = this.specialTokenIds.get(imEndTok);
-        if (id !== undefined) this.stopTokenIds.add(id);
+        // pretokenize 用の regex パターンを動的構築
+        // - 長いトークンを先に配置（最長一致優先）
+        // - 空文字・1文字以上のトークンをすべて含む
+        const sortedSpecial = [...this.specialTokenSet]
+            .filter(t => t.length > 0)
+            .sort((a, b) => b.length - a.length);  // 長い順
+        this._specialTokenPattern = sortedSpecial.map(_escapeRegex).join('|');
+
+        console.log(`[Tokenizer] Special tokens: ${sortedSpecial.length} (type-3 from GGUF + fallback)`);
+
+        // 終了判定用 stopTokenIds を構築
+        // im_end、および token_type=3 で "end" 系の名前を持つものを追加
+        for (const [tok, id] of this.specialTokenIds) {
+            if (tok === '<|im_end|>' || tok === '<|end_of_turn|>' ||
+                tok === '<|endoftext|>' || tok === '</s>') {
+                this.stopTokenIds.add(id);
+            }
+        }
     }
 
     tokenize(text, addBos = false, addEos = false) {
         const result = [];
         if (addBos && this.bosTokenId >= 0) result.push(this.bosTokenId);
 
-        const words = pretokenize(text, this.isQwen35);
+        const words = pretokenize(text, this.isQwen35, this._specialTokenPattern);
         for (const word of words) {
             if (!word || !word.length) continue;
+
+            // Direct vocab lookup — catches both regular tokens and special tokens
             const directId = this.tokenToId.get(word);
             if (directId !== undefined) {
                 result.push(directId);
                 continue;
             }
+
+            // Special/control token that is NOT in the vocab → skip it entirely
+            // (Never BPE-encode special tokens — they have no merge chains)
+            if (this.specialTokenSet.has(word)) {
+                console.warn(`[Tokenizer] Special token not in vocab, skipping: ${JSON.stringify(word)}`);
+                continue;
+            }
+
             if (word.length > 1024) {
                 for (const ch of word) {
                     result.push(...byteFallbackTokens(this.tokenToId, ch));
@@ -308,16 +344,17 @@ function byteFallbackTokens(tokenToId, ch) {
 }
 
 // --- Pre-tokenization（特殊トークンを保護） ---
+// specialPattern: GGUF から動的構築した regex alternation（空文字なら使わない）
 
-function pretokenize(text, isQwen35) {
+function pretokenize(text, isQwen35, specialPattern = '') {
     const basePat = isQwen35
         ? "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
         : "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
-    // 特殊トークンを最優先マッチとして先頭に追加
-    const pat = `(?:${SPECIAL_TOKEN_PATTERN})|${basePat}`;
+    // 特殊トークンを最優先マッチとして先頭に追加（パターンがある場合のみ）
+    const pat = specialPattern ? `(?:${specialPattern})|${basePat}` : basePat;
 
-    const regex = new RegExp(pat, 'dgu');
+    const regex = new RegExp(pat, 'gu');  // 'd' フラグは不要 (hasIndices は使っていない)
     const words = [];
     let m;
     while ((m = regex.exec(text)) !== null) {

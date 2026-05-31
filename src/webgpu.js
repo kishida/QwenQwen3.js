@@ -450,19 +450,38 @@ class GPUDevice {
         return pipeline;
     }
 
-    // Submit a compute dispatch
+    // Submit a compute dispatch (or accumulate into the current batch encoder)
     dispatch(pipeline, bindEntries, dispatchX, dispatchY = 1, dispatchZ = 1) {
         const bg = this.device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
             entries: bindEntries.map((e, i) => ({ binding: i, resource: e })),
         });
-        const enc = this.device.createCommandEncoder();
+        const enc = this._batchEnc ?? this.device.createCommandEncoder();
         const pass = enc.beginComputePass();
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, bg);
         pass.dispatchWorkgroups(dispatchX, dispatchY, dispatchZ);
         pass.end();
-        this.device.queue.submit([enc.finish()]);
+        if (!this._batchEnc) this.device.queue.submit([enc.finish()]);
+    }
+
+    // Batch mode: collect all GPU commands into one encoder, submit once at endBatch().
+    // This avoids the driver overhead of ~700 separate submit() calls per forward pass.
+    beginBatch() {
+        this._batchEnc      = this.device.createCommandEncoder();
+        this._batchDeferred = [];   // uniform buffers to destroy after submit
+    }
+    endBatch() {
+        if (!this._batchEnc) return;
+        this.device.queue.submit([this._batchEnc.finish()]);
+        this._batchEnc = null;
+        for (const b of this._batchDeferred) b.destroy();
+        this._batchDeferred = null;
+    }
+    // Destroy a buffer immediately, or defer it until after the current batch submits.
+    deferDestroy(buf) {
+        if (this._batchDeferred) this._batchDeferred.push(buf);
+        else buf.destroy();
     }
 
     buf(b) { return { buffer: b }; }  // shorthand for binding resource
@@ -986,6 +1005,959 @@ class Qwen3GPUEngine {
         }
         if (onFinish) onFinish(generatedTokens);
     }
+
+    formatChat(messages, systemPrompt) {
+        return this._cpu.formatChat(messages, systemPrompt);
+    }
+}
+
+// ============================================================
+//  WGSL Shader: LFM2 depthwise causal short-conv
+//  Each thread handles one dimension d independently.
+//  Computes: bx=B*x, conv1d with rolling state, y=C*conv_out
+//  Then shifts state left and appends bx — no cross-thread deps.
+// ============================================================
+const WGSL_SHORTCONV = /* wgsl */`
+struct P { nEmb: u32, lCache: u32 }
+@group(0) @binding(0) var<storage, read>       bcx:    array<f32>;   // [3*nEmb]: B|C|x from in_proj
+@group(0) @binding(1) var<storage, read_write> state:  array<f32>;   // [(lCache-1)*nEmb]: rolling
+@group(0) @binding(2) var<storage, read>       kernel: array<f32>;   // [nEmb*lCache]: [d*L+k]
+@group(0) @binding(3) var<storage, read_write> conv_y: array<f32>;   // [nEmb]: output
+@group(0) @binding(4) var<uniform>             p:      P;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = gid.x;
+    if (d >= p.nEmb) { return; }
+    let L     = p.lCache;    // = 3
+    let dConv = L - 1u;     // = 2
+
+    let B_d  = bcx[d];
+    let C_d  = bcx[p.nEmb + d];
+    let x_d  = bcx[2u * p.nEmb + d];
+    let bx_d = B_d * x_d;
+
+    // causal conv: sum past states then add current bx
+    var conv_out: f32 = 0.0;
+    for (var k = 0u; k < dConv; k++) {
+        conv_out += kernel[d * L + k] * state[k * p.nEmb + d];
+    }
+    conv_out += kernel[d * L + dConv] * bx_d;
+
+    // shift state: oldest drops off, newest = bx
+    for (var k = 0u; k + 1u < dConv; k++) {
+        state[k * p.nEmb + d] = state[(k + 1u) * p.nEmb + d];
+    }
+    if (dConv > 0u) {
+        state[(dConv - 1u) * p.nEmb + d] = bx_d;
+    }
+
+    conv_y[d] = C_d * conv_out;
+}`;
+
+// ============================================================
+//  WGSL Shader: F32 × F32 matrix-vector product
+//  Used for LFM2 router weights (small, often F32 in GGUF)
+// ============================================================
+const WGSL_MATMUL_F32 = /* wgsl */`
+struct P { inDim: u32, outDim: u32 }
+@group(0) @binding(0) var<storage, read>       weight:  array<f32>;
+@group(0) @binding(1) var<storage, read>        in_vec:  array<f32>;
+@group(0) @binding(2) var<storage, read_write>  out_vec: array<f32>;
+@group(0) @binding(3) var<uniform>              p:       P;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= p.outDim) { return; }
+    var dot: f32 = 0.0;
+    let base = c * p.inDim;
+    for (var i = 0u; i < p.inDim; i++) {
+        dot += weight[base + i] * in_vec[i];
+    }
+    out_vec[c] = dot;
+}`;
+
+// ============================================================
+//  WGSL Shader: MoE sigmoid routing + top-K (GPU-only)
+//  Computes: sigmoid(logits + bias), selects top-K by biased score,
+//  normalizes selected weights, stores result buffer:
+//    [0..topK-1]              = selected expert indices (f32)
+//    [topK..2*topK-1]         = normalized weights (f32)
+//    [2*topK..2*topK+nE-1]    = all sigmoid probs (f32, for viz)
+//  Supports up to 64 experts (workgroup size 64).
+// ============================================================
+const WGSL_MOE_SIGMOID_TOPK = /* wgsl */`
+struct STP { nExperts: u32, topK: u32, _p1: u32, _p2: u32 }
+@group(0) @binding(0) var<storage, read>       logits: array<f32>;
+@group(0) @binding(1) var<storage, read>        bias:   array<f32>;
+@group(0) @binding(2) var<storage, read_write>  result: array<f32>;
+@group(0) @binding(3) var<uniform>              p:      STP;
+
+var<workgroup> wg_probs: array<f32, 64>;
+var<workgroup> wg_sel:   array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let e  = lid.x;
+    let nE = p.nExperts;
+    if (e < nE) {
+        let prob  = 1.0 / (1.0 + exp(-logits[e]));
+        wg_probs[e] = prob;
+        wg_sel[e]   = prob + bias[e];
+    } else {
+        wg_probs[e] = 0.0;
+        wg_sel[e]   = -1e38;
+    }
+    workgroupBarrier();
+    if (e != 0u) { return; }
+    // Thread 0: sequential top-K (nE=32, topK=4 — tiny)
+    var sumW: f32 = 1e-6;
+    for (var k = 0u; k < p.topK; k++) {
+        var best: f32 = -1e38;
+        var bestI: u32 = 0u;
+        for (var i = 0u; i < nE; i++) {
+            if (wg_sel[i] > best) { best = wg_sel[i]; bestI = i; }
+        }
+        result[k]           = f32(bestI);
+        result[p.topK + k]  = wg_probs[bestI];
+        sumW               += wg_probs[bestI];
+        wg_sel[bestI]       = -1e38;
+    }
+    let inv = 1.0 / sumW;
+    for (var k = 0u; k < p.topK; k++) { result[p.topK + k] *= inv; }
+    for (var i = 0u; i < nE; i++) { result[2u * p.topK + i] = wg_probs[i]; }
+}`;
+
+// ============================================================
+//  WGSL Shader: Q8_0 expert matmul — expert index from routing buf
+//  Params: inDim, outDim, slotK (which top-K slot), bytesPerExpert
+//  Reads expertIdx = u32(routingResult[slotK]) at runtime.
+// ============================================================
+const WGSL_MATMUL_EXPERT_Q80 = /* wgsl */`
+struct P { inDim: u32, outDim: u32, slotK: u32, bytesPerExpert: u32 }
+@group(0) @binding(0) var<storage, read>       weight:        array<u32>;
+@group(0) @binding(1) var<storage, read>        in_vec:        array<f32>;
+@group(0) @binding(2) var<storage, read_write>  out_vec:       array<f32>;
+@group(0) @binding(3) var<uniform>              p:             P;
+@group(0) @binding(4) var<storage, read>        routingResult: array<f32>;
+
+fn rb(o: u32) -> u32 { return (weight[o >> 2u] >> ((o & 3u) << 3u)) & 0xFFu; }
+fn rf16(o: u32) -> f32 { return unpack2x16float(rb(o) | (rb(o + 1u) << 8u)).x; }
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= p.outDim) { return; }
+    let expertIdx  = u32(routingResult[p.slotK]);
+    let expertBase = expertIdx * p.bytesPerExpert;
+    let bpc        = (p.inDim + 31u) >> 5u;
+    let colBase    = expertBase + c * bpc * 34u;
+    var dot: f32   = 0.0;
+    for (var b = 0u; b < bpc; b++) {
+        let bb   = colBase + b * 34u;
+        let d    = rf16(bb);
+        let eb   = b << 5u;
+        let maxI = min(32u, p.inDim - eb);
+        var bd: f32 = 0.0;
+        for (var i = 0u; i < maxI; i++) {
+            let qb = rb(bb + 2u + i);
+            let q  = f32(bitcast<i32>(qb << 24u) >> 24u);
+            bd += in_vec[eb + i] * q;
+        }
+        dot += bd * d;
+    }
+    out_vec[c] = dot;
+}`;
+
+// ============================================================
+//  WGSL Shader: K-quant expert matmul — expert index from routing buf
+//  Same dequant logic as WGSL_MATMUL_KQUANT, plus expertBase offset.
+// ============================================================
+const WGSL_MATMUL_EXPERT_KQUANT = /* wgsl */`
+struct P { inDim: u32, outDim: u32, qtype: u32, blockBytes: u32,
+           slotK: u32, bytesPerExpert: u32, _p2: u32, _p3: u32 }
+@group(0) @binding(0) var<storage, read>       weight:        array<u32>;
+@group(0) @binding(1) var<storage, read>        in_vec:        array<f32>;
+@group(0) @binding(2) var<storage, read_write>  out_vec:       array<f32>;
+@group(0) @binding(3) var<uniform>              p:             P;
+@group(0) @binding(4) var<storage, read>        routingResult: array<f32>;
+
+fn rb(o: u32) -> u32 { return (weight[o >> 2u] >> ((o & 3u) << 3u)) & 0xFFu; }
+fn rf16(o: u32) -> f32 { return unpack2x16float(rb(o) | (rb(o + 1u) << 8u)).x; }
+fn ri8(o: u32) -> f32 { return f32(bitcast<i32>(rb(o) << 24u) >> 24u); }
+
+fn q4k_scale_min(scaleBase: u32, j: u32, sc: ptr<function,f32>, mn: ptr<function,f32>) {
+    var s: u32; var m: u32;
+    if (j < 4u) {
+        s = rb(scaleBase + j) & 63u;
+        m = rb(scaleBase + j + 4u) & 63u;
+    } else {
+        let jj = j - 4u;
+        s = (rb(scaleBase + j + 4u) & 0xFu) | ((rb(scaleBase + jj) >> 6u) << 4u);
+        m = (rb(scaleBase + j + 4u) >> 4u) | ((rb(scaleBase + j) >> 6u) << 4u);
+    }
+    *sc = f32(s); *mn = f32(m);
+}
+fn q3k_scale(scaleBase: u32, sub: u32) -> f32 {
+    let lo4 = (rb(scaleBase + (sub & 7u)) >> ((sub >> 3u) << 2u)) & 0xFu;
+    let hi2 = (rb(scaleBase + 8u + (sub & 3u)) >> ((sub >> 2u) * 2u)) & 0x3u;
+    return f32(lo4 | (hi2 << 4u)) - 32.0;
+}
+
+fn dequant(bb: u32, e: u32) -> f32 {
+    var result: f32 = 0.0;
+    switch p.qtype {
+        case 10u: {
+            let d = rf16(bb + 80u); let dm = rf16(bb + 82u);
+            let sb = rb(bb + (e >> 4u));
+            let qb = bb + 16u + (e >> 7u)*32u + ((e >> 4u) & 1u)*16u + (e & 15u);
+            let q = (rb(qb) >> (((e >> 5u) & 3u) * 2u)) & 3u;
+            result = d * f32(sb & 0xFu) * f32(q) - dm * f32((sb >> 4u) & 0xFu);
+        }
+        case 11u: {
+            let d = rf16(bb + 108u);
+            let scale = q3k_scale(bb + 96u, e >> 4u);
+            let hb = (rb(bb + ((e >> 4u) & 1u)*16u + (e & 15u)) >> (e >> 5u)) & 1u;
+            let qb = bb + 32u + (e >> 7u)*32u + ((e >> 4u) & 1u)*16u + (e & 15u);
+            let low2 = (rb(qb) >> (((e >> 5u) & 3u) * 2u)) & 3u;
+            result = d * scale * f32(i32(low2 | (hb << 2u)) - 4);
+        }
+        case 12u: {
+            let d = rf16(bb); let dm = rf16(bb + 2u);
+            var sc: f32; var mn: f32;
+            let sub = (e >> 6u) * 2u + ((e >> 5u) & 1u);
+            q4k_scale_min(bb + 4u, sub, &sc, &mn);
+            let qb = rb(bb + 16u + (e >> 6u) * 32u + (e & 31u));
+            let q = select((qb >> 4u) & 0xFu, qb & 0xFu, ((e >> 5u) & 1u) == 0u);
+            result = d * sc * f32(q) - dm * mn;
+        }
+        case 13u: {
+            let d = rf16(bb); let dm = rf16(bb + 2u);
+            var sc: f32; var mn: f32;
+            let sub = (e >> 6u) * 2u + ((e >> 5u) & 1u);
+            q4k_scale_min(bb + 4u, sub, &sc, &mn);
+            let qh_bit = (e >> 6u) * 2u + ((e >> 5u) & 1u);
+            let hb = (rb(bb + 16u + (e & 31u)) >> qh_bit) & 1u;
+            let qb = rb(bb + 48u + (e >> 6u) * 32u + (e & 31u));
+            let low4 = select((qb >> 4u) & 0xFu, qb & 0xFu, ((e >> 5u) & 1u) == 0u);
+            result = d * sc * f32(low4 | (hb << 4u)) - dm * mn;
+        }
+        case 14u: {
+            let d = rf16(bb + 208u);
+            let ql_idx = (e >> 7u) * 64u + ((e >> 5u) & 1u) * 32u + (e & 31u);
+            let qlb = rb(bb + ql_idx);
+            let low4 = select((qlb >> 4u) & 0xFu, qlb & 0xFu, ((e >> 6u) & 1u) == 0u);
+            let qh_idx = (e >> 7u) * 32u + (e & 31u);
+            let qh_shift = ((e >> 5u) & 3u) * 2u;
+            let high2 = (rb(bb + 128u + qh_idx) >> qh_shift) & 3u;
+            let sc_idx = (e >> 7u) * 8u + ((e >> 5u) & 3u) * 2u + ((e & 31u) >> 4u);
+            let scaleByte = rb(bb + 192u + sc_idx);
+            let sc = f32(bitcast<i32>(scaleByte << 24u) >> 24u);
+            result = d * sc * f32(i32(low4 | (high2 << 4u)) - 32);
+        }
+        default: { result = 0.0; }
+    }
+    return result;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= p.outDim) { return; }
+    let expertIdx  = u32(routingResult[p.slotK]);
+    let expertBase = expertIdx * p.bytesPerExpert;
+    let bpc        = (p.inDim + 255u) / 256u;
+    let colBase    = expertBase + c * bpc * p.blockBytes;
+    var dot: f32   = 0.0;
+    for (var b = 0u; b < bpc; b++) {
+        let bb   = colBase + b * p.blockBytes;
+        let eb   = b * 256u;
+        let maxI = min(256u, p.inDim - eb);
+        for (var i = 0u; i < maxI; i++) {
+            dot += dequant(bb, i) * in_vec[eb + i];
+        }
+    }
+    out_vec[c] = dot;
+}`;
+
+// ============================================================
+//  WGSL Shader: Expert-weight AXPY — weight comes from routing buf
+//  out[i] += routingResult[topK + slotK] * b[i]
+// ============================================================
+const WGSL_AXPY_EXPERT = /* wgsl */`
+struct P { n: u32, slotK: u32, topK: u32, _pad: u32 }
+@group(0) @binding(0) var<storage, read_write>  a:             array<f32>;
+@group(0) @binding(1) var<storage, read>         b:             array<f32>;
+@group(0) @binding(2) var<uniform>               p:             P;
+@group(0) @binding(3) var<storage, read>         routingResult: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= p.n) { return; }
+    let w  = routingResult[p.topK + p.slotK];
+    a[i]  += w * b[i];
+}`;
+
+// ============================================================
+//  Lfm2GPUEngine — WebGPU-accelerated LFM2/LFM2-MoE inference
+//
+//  Architecture vs Qwen3GPU:
+//    - 18 recurrent (short-conv) + 6 attention layers
+//    - Short-conv: GPU matmuls (in_proj/out_proj) + GPU conv shader
+//    - Conv states stored in GPU buffers, cleared on reset
+//    - Conv kernels pre-dequantized to F32, uploaded at load time
+//    - KV cache: 6 layers only, indexed by attnCacheIdx
+//    - MoE routing: fully on GPU (sigmoid+topK shader), batch readback after each token
+// ============================================================
+class Lfm2GPUEngine {
+    constructor() {}
+
+    static async create(gguf) {
+        const eng = new Lfm2GPUEngine();
+        eng._gpu = await GPUDevice.create();
+        eng._cpu = new Lfm2Engine(gguf);
+        const cpu = eng._cpu;
+
+        // Mirror CPU engine fields
+        eng.nLayers      = cpu.nLayers;
+        eng.nEmb         = cpu.nEmb;
+        eng.nHeads       = cpu.nHeads;
+        eng.nHeadKV      = cpu.nHeadKV;
+        eng.headDim      = cpu.headDim;
+        eng.nKV          = cpu.nKV;
+        eng.nFF          = cpu.nFF;
+        eng.nFFExp       = cpu.nFFExp;
+        eng.nExperts     = cpu.nExperts;
+        eng.nExpertsUsed = cpu.nExpertsUsed;
+        eng.nVocab       = cpu.nVocab;
+        eng.eps          = cpu.eps;
+        eng.ropeFreqBase = cpu.ropeFreqBase;
+        eng.maxCtx       = cpu.maxCtx;
+        eng.lCache       = cpu.lCache;
+        eng.dConv        = cpu.dConv;
+        eng.nAttnLayers  = cpu.nAttnLayers;
+        eng.isMoE        = true;
+        eng.layers       = cpu.layers;
+        eng.tokenizer    = cpu.tokenizer;
+        eng.onRouterUpdate  = null;
+        eng.expertMask      = null;
+        eng.batchRouterUpdate = true;   // routing data is batch-read after each token
+        eng._gpuRoutingBufs     = [];   // per-MoE-layer routing result buffers
+        eng._moeAbsLayerIndices = [];   // maps moeIdx → absolute layer index
+
+        console.log('[GPU-LFM2] Compiling shaders...');
+        const [matmulQ80, matmulKQ, matmulF32, rmsnorm, rope, siluMul, addResidual, copy, attention, axpy,
+               shortconv, moeSigmoidTopK, matmulExpertQ80, matmulExpertKQ, axpyExpert] =
+            await Promise.all([
+                eng._gpu.getOrCreatePipeline('matmul_q8_0',          WGSL_MATMUL_Q8_0),
+                eng._gpu.getOrCreatePipeline('matmul_kquant',         WGSL_MATMUL_KQUANT),
+                eng._gpu.getOrCreatePipeline('matmul_f32',            WGSL_MATMUL_F32),
+                eng._gpu.getOrCreatePipeline('rmsnorm',               WGSL_RMSNORM),
+                eng._gpu.getOrCreatePipeline('rope',                  WGSL_ROPE),
+                eng._gpu.getOrCreatePipeline('silu_mul',              WGSL_ELEMENTWISE, 'silu_mul'),
+                eng._gpu.getOrCreatePipeline('add_residual',          WGSL_ELEMENTWISE, 'add_residual'),
+                eng._gpu.getOrCreatePipeline('copy',                  WGSL_COPY),
+                eng._gpu.getOrCreatePipeline('attention',             WGSL_ATTENTION),
+                eng._gpu.getOrCreatePipeline('axpy',                  WGSL_AXPY),
+                eng._gpu.getOrCreatePipeline('shortconv',             WGSL_SHORTCONV),
+                eng._gpu.getOrCreatePipeline('moe_sigmoid_topk',      WGSL_MOE_SIGMOID_TOPK),
+                eng._gpu.getOrCreatePipeline('matmul_expert_q80',     WGSL_MATMUL_EXPERT_Q80),
+                eng._gpu.getOrCreatePipeline('matmul_expert_kquant',  WGSL_MATMUL_EXPERT_KQUANT),
+                eng._gpu.getOrCreatePipeline('axpy_expert',           WGSL_AXPY_EXPERT),
+            ]);
+        eng._pipelines = { matmulQ80, matmulKQ, matmulF32, rmsnorm, rope, siluMul, addResidual, copy, attention, axpy,
+                           shortconv, moeSigmoidTopK, matmulExpertQ80, matmulExpertKQ, axpyExpert };
+        console.log('[GPU-LFM2] Shaders compiled OK.');
+
+        console.log('[GPU-LFM2] Uploading weights...');
+        await eng._uploadWeights();
+        console.log('[GPU-LFM2] Ready.');
+
+        eng._allocGPUBuffers();
+        eng._gpuMaxCtx = Math.min(cpu.maxCtx, 2048);
+        eng._allocGPUKVCache();
+
+        return eng;
+    }
+
+    async _uploadWeights() {
+        const g   = this._gpu;
+        const cpu = this._cpu;
+
+        const upload = (meta) => {
+            if (!meta) return null;
+            const slice = new Uint8Array(meta.buffer, meta.offset, meta.nbytes);
+            return g.uploadBuffer(slice);
+        };
+
+        this._gpuW = {
+            tokEmbd:    upload(cpu.tokEmbd),
+            outputNorm: upload(cpu.outputNorm),
+            output:     upload(cpu.output),
+            layers:     [],
+        };
+
+        // Shared zero-bias buffer for MoE layers without expProbsBias
+        const zeroBiasF32 = new Float32Array(cpu.nExperts);
+        this._gpuZeroBias = g.uploadBuffer(zeroBiasF32);
+
+        // Per-layer GPU conv states (only for recurrent layers)
+        this._gpuConvStates = new Array(cpu.nLayers).fill(null);
+
+        for (let i = 0; i < cpu.nLayers; i++) {
+            const l = cpu.layers[i];
+            const gl = {
+                isRecurrent: l.isRecurrent,
+                isMoE:       l.isMoE,
+                isDense:     l.isDense,
+                _cpuLayer:   l,
+            };
+
+            gl.attnNorm = upload(l.attnNorm);
+            gl.ffnNorm  = upload(l.ffnNorm);
+
+            if (l.isRecurrent) {
+                gl.shortconvInProj  = upload(l.shortconvInProj);
+                gl.shortconvOutProj = upload(l.shortconvOutProj);
+                // Conv kernel pre-dequantized to F32 at construction time — upload directly
+                gl.convKernel = g.uploadBuffer(l.convKernelF32);
+
+                // Zero-initialised GPU conv state: [dConv * nEmb] f32
+                const stateElems = cpu.dConv * cpu.nEmb;
+                this._gpuConvStates[i] = g.createBuffer(stateElems * 4);
+                const enc = g.device.createCommandEncoder();
+                enc.clearBuffer(this._gpuConvStates[i]);
+                g.device.queue.submit([enc.finish()]);
+            } else {
+                gl.wq    = upload(l.wq);
+                gl.wk    = upload(l.wk);
+                gl.wv    = upload(l.wv);
+                gl.wo    = upload(l.wo);
+                gl.qNorm = upload(l.qNorm);
+                gl.kNorm = upload(l.kNorm);
+            }
+
+            if (l.isDense) {
+                gl.ffnGate = upload(l.ffnGate);
+                gl.ffnUp   = upload(l.ffnUp);
+                gl.ffnDown = upload(l.ffnDown);
+            } else {
+                // ---- GPU MoE routing ----
+                const moeIdx = this._gpuRoutingBufs.length;
+                gl._moeIdx   = moeIdx;
+                this._moeAbsLayerIndices.push(i);
+
+                // Router weight (F32 or quantized) — uploaded as-is, shader handles type
+                gl.routerWeightGPU = upload(l.routerWeight);
+
+                // Expert selection bias (F32 vector, may be absent)
+                if (l.expProbsBias) {
+                    const biasF32 = _readWeightF32(l.expProbsBias, cpu.nExperts);
+                    gl.expProbsBiasGPU = g.uploadBuffer(biasF32);
+                } else {
+                    gl.expProbsBiasGPU = this._gpuZeroBias;  // shared zeros
+                }
+
+                // Routing result buffer: [topK indices | topK weights | nExperts probs]
+                const resultFloats = 2 * cpu.nExpertsUsed + cpu.nExperts;
+                this._gpuRoutingBufs.push(g.createBuffer(resultFloats * 4));
+
+                // Expert weight tensors
+                gl.ffnGateExps = upload(l.ffnGateExps);
+                gl.ffnUpExps   = upload(l.ffnUpExps);
+                gl.ffnDownExps = upload(l.ffnDownExps);
+            }
+
+            this._gpuW.layers.push(gl);
+            if (i % 4 === 0) await yieldToBrowser();
+        }
+    }
+
+    _allocGPUBuffers() {
+        const g = this._gpu;
+        const f32 = n => g.createBuffer(n * 4);
+        const cpu = this._cpu;
+        const nQ  = cpu.nHeads  * cpu.headDim;
+        const nKV = cpu.nHeadKV * cpu.headDim;
+        this._buf = {
+            hidden:       f32(cpu.nEmb),
+            normed:       f32(cpu.nEmb),
+            bcx:          f32(3 * cpu.nEmb),   // in_proj output for short-conv
+            convY:        f32(cpu.nEmb),        // short-conv result, fed to out_proj
+            q:            f32(nQ),
+            k:            f32(nKV),
+            v:            f32(nKV),
+            attnOut:      f32(nQ),
+            proj:         f32(cpu.nEmb),
+            gate:         f32(Math.max(cpu.nFF, cpu.nFFExp)),
+            up:           f32(Math.max(cpu.nFF, cpu.nFFExp)),
+            down:         f32(cpu.nEmb),
+            moeAcc:       f32(cpu.nEmb),
+            routerLogits: f32(cpu.nExperts),   // router matmul output (nExperts)
+            logits:       f32(cpu.nVocab),
+        };
+    }
+
+    _allocGPUKVCache() {
+        const g = this._gpu;
+        const cpu = this._cpu;
+        const floatCount = this._gpuMaxCtx * cpu.nHeadKV * cpu.headDim;
+        const kvBytes    = floatCount * 4;
+        this._kvCacheK = [];
+        this._kvCacheV = [];
+        for (let l = 0; l < cpu.nAttnLayers; l++) {
+            this._kvCacheK.push(g.createBuffer(kvBytes));
+            this._kvCacheV.push(g.createBuffer(kvBytes));
+        }
+        const totalMB = (cpu.nAttnLayers * 2 * kvBytes / 1024 / 1024).toFixed(0);
+        console.log(`[GPU-LFM2] KV cache: ${cpu.nAttnLayers}L × 2 × ${(kvBytes / 1024).toFixed(0)} KB = ${totalMB} MB`);
+    }
+
+    // ---- GPU helper methods (same logic as Qwen3GPUEngine) ----
+
+    _matmul(weightBuf, inputBuf, outputBuf, meta, outDim) {
+        const g = this._gpu;
+        const inDim = meta.shape[0];
+        const type  = meta.type;
+        if (type === 0) {
+            // F32 weight (common for router weights)
+            const uBuf = g.createUniformBuffer(new Uint32Array([inDim, outDim]));
+            g.dispatch(this._pipelines.matmulF32,
+                [g.buf(weightBuf), g.buf(inputBuf), g.buf(outputBuf), g.ubuf(uBuf)],
+                Math.ceil(outDim / 256));
+            g.deferDestroy(uBuf);
+        } else if (type === 8) {
+            const uBuf = g.createUniformBuffer(new Uint32Array([inDim, outDim]));
+            g.dispatch(this._pipelines.matmulQ80,
+                [g.buf(weightBuf), g.buf(inputBuf), g.buf(outputBuf), g.ubuf(uBuf)],
+                Math.ceil(outDim / 256));
+            g.deferDestroy(uBuf);
+        } else if (type >= 10 && type <= 14) {
+            const blockBytes = [0,0,0,0,0,0,0,0,0,0, 84,110,144,176,210][type];
+            const uBuf = g.createUniformBuffer(new Uint32Array([inDim, outDim, type, blockBytes]));
+            g.dispatch(this._pipelines.matmulKQ,
+                [g.buf(weightBuf), g.buf(inputBuf), g.buf(outputBuf), g.ubuf(uBuf)],
+                Math.ceil(outDim / 256));
+            g.deferDestroy(uBuf);
+        } else {
+            throw new Error(`GPU-LFM2 matmul: unsupported type ${type}`);
+        }
+    }
+
+    _rmsnorm(dataBuf, weightBuf, totalN, headDim = null) {
+        const g = this._gpu;
+        const hd = headDim ?? totalN;
+        const nHeads = totalN / hd;
+        const params = new ArrayBuffer(8);
+        new Uint32Array(params)[0] = hd;
+        new Float32Array(params)[1] = this.eps;
+        const pBuf = g.createUniformBuffer(params);
+        g.dispatch(this._pipelines.rmsnorm,
+            [g.buf(dataBuf), g.buf(weightBuf), g.ubuf(pBuf)],
+            nHeads);
+        g.deferDestroy(pBuf);
+    }
+
+    _rope(dataBuf, nHeads, headDim, position) {
+        const g = this._gpu;
+        const params = new ArrayBuffer(16);
+        const u32 = new Uint32Array(params);
+        const f32 = new Float32Array(params);
+        u32[0] = nHeads; u32[1] = headDim; u32[2] = position; f32[3] = this.ropeFreqBase;
+        const pBuf = g.createUniformBuffer(params);
+        g.dispatch(this._pipelines.rope,
+            [g.buf(dataBuf), g.ubuf(pBuf)],
+            Math.ceil(nHeads * (headDim / 2) / 64));
+        g.deferDestroy(pBuf);
+    }
+
+    _addResidual(aBuf, bBuf, n) {
+        const g = this._gpu;
+        const uBuf = g.createUniformBuffer(new Uint32Array([n]));
+        g.dispatch(this._pipelines.addResidual,
+            [g.buf(aBuf), g.buf(bBuf), g.ubuf(uBuf)],
+            Math.ceil(n / 256));
+        g.deferDestroy(uBuf);
+    }
+
+    _axpy(aBuf, bBuf, n, scale) {
+        const g = this._gpu;
+        const params = new ArrayBuffer(8);
+        new Uint32Array(params)[0] = n;
+        new Float32Array(params)[1] = scale;
+        const uBuf = g.createUniformBuffer(params);
+        g.dispatch(this._pipelines.axpy,
+            [g.buf(aBuf), g.buf(bBuf), g.ubuf(uBuf)],
+            Math.ceil(n / 256));
+        g.deferDestroy(uBuf);
+    }
+
+    _siluMul(aBuf, bBuf, n) {
+        const g = this._gpu;
+        const uBuf = g.createUniformBuffer(new Uint32Array([n]));
+        g.dispatch(this._pipelines.siluMul,
+            [g.buf(aBuf), g.buf(bBuf), g.ubuf(uBuf)],
+            Math.ceil(n / 256));
+        g.deferDestroy(uBuf);
+    }
+
+    // Use the batch encoder if available, otherwise create/submit its own
+    _copy(srcBuf, dstBuf, n) {
+        const g = this._gpu;
+        const enc = g._batchEnc ?? g.device.createCommandEncoder();
+        enc.copyBufferToBuffer(srcBuf, 0, dstBuf, 0, n * 4);
+        if (!g._batchEnc) g.device.queue.submit([enc.finish()]);
+    }
+
+    // ---- Short-conv GPU dispatch ----
+    _shortconvGPU(layerIdx, gl) {
+        const g = this._gpu;
+        const params = new Uint32Array([this.nEmb, this.lCache]);
+        const pBuf = g.createUniformBuffer(params);
+        g.dispatch(this._pipelines.shortconv, [
+            g.buf(this._buf.bcx),
+            g.buf(this._gpuConvStates[layerIdx]),
+            g.buf(gl.convKernel),
+            g.buf(this._buf.convY),
+            g.ubuf(pBuf),
+        ], Math.ceil(this.nEmb / 256));
+        g.deferDestroy(pBuf);
+    }
+
+    // ---- Store K/V into GPU KV cache (kvIdx = attnCacheIdx, 0-5) ----
+    _storeKVGPU(kvIdx, position) {
+        if (position >= this._gpuMaxCtx) return;
+        const g = this._gpu;
+        const byteOffset = position * this.nHeadKV * this.headDim * 4;
+        const byteSize   = this.nHeadKV * this.headDim * 4;
+        const enc = g._batchEnc ?? g.device.createCommandEncoder();
+        enc.copyBufferToBuffer(this._buf.k, 0, this._kvCacheK[kvIdx], byteOffset, byteSize);
+        enc.copyBufferToBuffer(this._buf.v, 0, this._kvCacheV[kvIdx], byteOffset, byteSize);
+        if (!g._batchEnc) g.device.queue.submit([enc.finish()]);
+    }
+
+    // ---- GPU GQA attention (uses attnCacheIdx-indexed KV cache) ----
+    _attentionGPU(kvIdx, position) {
+        const g = this._gpu;
+        const seqLen = position + 1;
+        const scale  = 1.0 / Math.sqrt(this.headDim);
+        const params = new ArrayBuffer(32);
+        const u32 = new Uint32Array(params);
+        const f32 = new Float32Array(params);
+        u32[0] = this.nHeads;  u32[1] = this.nHeadKV;
+        u32[2] = this.headDim; u32[3] = this.headDim;
+        u32[4] = seqLen;       u32[5] = this._gpuMaxCtx;
+        f32[6] = scale;        u32[7] = 0;
+        const pBuf = g.createUniformBuffer(params);
+        g.dispatch(this._pipelines.attention, [
+            g.buf(this._buf.q),
+            g.buf(this._kvCacheK[kvIdx]),
+            g.buf(this._kvCacheV[kvIdx]),
+            g.buf(this._buf.attnOut),
+            g.ubuf(pBuf),
+        ], this.nHeads);
+        g.deferDestroy(pBuf);
+    }
+
+    // ---- Dispatch GPU sigmoid+topK for one MoE layer ----
+    _moeSigmoidTopK(moeIdx, gl) {
+        const g   = this._gpu;
+        const cpu = this._cpu;
+        const params = new Uint32Array([cpu.nExperts, cpu.nExpertsUsed, 0, 0]);
+        const pBuf = g.createUniformBuffer(params);
+        g.dispatch(this._pipelines.moeSigmoidTopK, [
+            g.buf(this._buf.routerLogits),
+            g.buf(gl.expProbsBiasGPU),
+            g.buf(this._gpuRoutingBufs[moeIdx]),
+            g.ubuf(pBuf),
+        ], 1);
+        g.deferDestroy(pBuf);
+    }
+
+    // ---- Compute bytesPerExpert for a packed expert weight tensor ----
+    _bytesPerExpert(cpuMeta, outDim, inDim) {
+        const blockBytes    = this._cpu._blockSizeForType(cpuMeta.type);
+        const elemsPerBlock = cpuMeta.type >= 10 ? 256 : 32;
+        const blocksPerCol  = Math.ceil(inDim / elemsPerBlock);
+        return outDim * blocksPerCol * blockBytes;
+    }
+
+    // ---- Expert matmul: reads expert index from routing buffer at runtime ----
+    _matmulExpert(slotK, moeIdx, gpuWeightBuf, inputBuf, outputBuf, cpuMeta, outDim, inDim) {
+        const g    = this._gpu;
+        const type = cpuMeta.type;
+        const bpe  = this._bytesPerExpert(cpuMeta, outDim, inDim);
+        const routingBuf = this._gpuRoutingBufs[moeIdx];
+        if (type === 8) {
+            const pBuf = g.createUniformBuffer(new Uint32Array([inDim, outDim, slotK, bpe]));
+            g.dispatch(this._pipelines.matmulExpertQ80, [
+                g.buf(gpuWeightBuf), g.buf(inputBuf), g.buf(outputBuf),
+                g.ubuf(pBuf), g.buf(routingBuf),
+            ], Math.ceil(outDim / 256));
+            g.deferDestroy(pBuf);
+        } else if (type >= 10 && type <= 14) {
+            const blockBytes = [0,0,0,0,0,0,0,0,0,0, 84,110,144,176,210][type];
+            const pBuf = g.createUniformBuffer(
+                new Uint32Array([inDim, outDim, type, blockBytes, slotK, bpe, 0, 0]));
+            g.dispatch(this._pipelines.matmulExpertKQ, [
+                g.buf(gpuWeightBuf), g.buf(inputBuf), g.buf(outputBuf),
+                g.ubuf(pBuf), g.buf(routingBuf),
+            ], Math.ceil(outDim / 256));
+            g.deferDestroy(pBuf);
+        } else {
+            throw new Error(`GPU-LFM2 expert matmul: unsupported weight type ${type}`);
+        }
+    }
+
+    // ---- Expert AXPY: weight = routingResult[topK + slotK] ----
+    _axpyExpert(slotK, topK, moeIdx, accBuf, addBuf, n) {
+        const g = this._gpu;
+        const pBuf = g.createUniformBuffer(new Uint32Array([n, slotK, topK, 0]));
+        g.dispatch(this._pipelines.axpyExpert, [
+            g.buf(accBuf), g.buf(addBuf),
+            g.ubuf(pBuf), g.buf(this._gpuRoutingBufs[moeIdx]),
+        ], Math.ceil(n / 256));
+        g.deferDestroy(pBuf);
+    }
+
+    // ---- MoE FFN: fully on GPU, zero CPU roundtrips during forward pass ----
+    //  1. Router matmul on GPU → routerLogits
+    //  2. Sigmoid + top-K on GPU → routing buffer (read back later in batch)
+    //  3. Expert matmuls use indices from routing buffer — no CPU involvement
+    _moEFFNGPU(layerIdx, gl, cl) {
+        const g   = this._gpu;
+        const cpu = this._cpu;
+        const moeIdx = gl._moeIdx;
+
+        // 1. Router matmul: normed → routerLogits
+        this._matmul(gl.routerWeightGPU, this._buf.normed, this._buf.routerLogits,
+                     cl.routerWeight, cpu.nExperts);
+
+        // 2. GPU sigmoid + top-K → routing buffer for this layer
+        this._moeSigmoidTopK(moeIdx, gl);
+
+        // 3. Clear MoE accumulator (use batch encoder if active)
+        const clearEnc = g._batchEnc ?? g.device.createCommandEncoder();
+        clearEnc.clearBuffer(this._buf.moeAcc);
+        if (!g._batchEnc) g.device.queue.submit([clearEnc.finish()]);
+
+        const topK   = cpu.nExpertsUsed;
+        const hidDim = cl.ffnGateExps.shape[1];
+        const inDim  = cl.ffnGateExps.shape[0];
+
+        // 4. For each top-K slot, dispatch expert matmuls (indices resolved GPU-side)
+        for (let k = 0; k < topK; k++) {
+            this._matmulExpert(k, moeIdx, gl.ffnGateExps, this._buf.normed, this._buf.gate,
+                               cl.ffnGateExps, hidDim, inDim);
+            this._matmulExpert(k, moeIdx, gl.ffnUpExps,   this._buf.normed, this._buf.up,
+                               cl.ffnUpExps,   hidDim, inDim);
+            this._siluMul(this._buf.gate, this._buf.up, hidDim);
+            this._matmulExpert(k, moeIdx, gl.ffnDownExps, this._buf.gate, this._buf.down,
+                               cl.ffnDownExps, this.nEmb, hidDim);
+            this._axpyExpert(k, topK, moeIdx, this._buf.moeAcc, this._buf.down, this.nEmb);
+        }
+
+        this._addResidual(this._buf.hidden, this._buf.moeAcc, this.nEmb);
+        // No await — no GPU→CPU sync during forward pass!
+    }
+
+    // ---- Batch-read all MoE routing results after each token ----
+    //  Called once per generated token (not per layer).
+    //  Uses Promise.all for parallel GPU→CPU readback across all MoE layers.
+    async _readbackRoutingData() {
+        if (!this.onRouterUpdate) return;
+        const cpu       = this._cpu;
+        const topK      = cpu.nExpertsUsed;
+        const nExperts  = cpu.nExperts;
+        const resultFloats = 2 * topK + nExperts;
+
+        const results = await Promise.all(
+            this._gpuRoutingBufs.map(buf => this._gpu.readF32(buf, resultFloats))
+        );
+
+        for (let m = 0; m < results.length; m++) {
+            const res      = results[m];
+            const selected = Array.from({ length: topK },  (_, k) => Math.round(res[k]));
+            const weights  = Array.from({ length: topK },  (_, k) => res[topK + k]);
+            const probs    = Array.from(res.subarray(2 * topK, 2 * topK + nExperts));
+            this.onRouterUpdate({
+                layer:    this._moeAbsLayerIndices[m],
+                probs,
+                selected,
+                weights,
+            });
+        }
+    }
+
+    // ================================================================
+    //  Forward pass — one token, fully on GPU except:
+    //    - embedding lookup (CPU → GPU upload, ~8KB)
+    //    - logits (1× GPU→CPU readback when !skipLogits, nVocab×4B)
+    //  MoE routing is now GPU-only (no CPU roundtrip per layer).
+    //  Routing results are batch-read in _readbackRoutingData() after generate().
+    // ================================================================
+    async forward(tokenId, position, skipLogits = false) {
+        const g   = this._gpu;
+        const cpu = this._cpu;
+
+        // Embedding lookup on CPU, then upload to GPU hidden buffer
+        const emb = embeddingLookupGeneric(cpu.tokEmbd, tokenId);
+        g.device.queue.writeBuffer(this._buf.hidden, 0, emb);
+
+        const nQ  = cpu.nHeads  * cpu.headDim;
+        const nKV = cpu.nHeadKV * cpu.headDim;
+
+        // Begin batching: all GPU commands for this forward pass go into one encoder.
+        // This eliminates ~700 separate submit() calls and their driver overhead.
+        g.beginBatch();
+
+        for (let l = 0; l < this.nLayers; l++) {
+            const gl = this._gpuW.layers[l];
+            const cl = cpu.layers[l];
+
+            // Pre-norm (operator block)
+            this._copy(this._buf.hidden, this._buf.normed, this.nEmb);
+            this._rmsnorm(this._buf.normed, gl.attnNorm, this.nEmb);
+
+            if (cl.isRecurrent) {
+                // --- Short-conv recurrent block ---
+                // in_proj: normed → bcx [3*nEmb]
+                this._matmul(gl.shortconvInProj, this._buf.normed, this._buf.bcx, cl.shortconvInProj, 3 * this.nEmb);
+                // conv shader: bcx + state + kernel → conv_y; updates state in-place
+                this._shortconvGPU(l, gl);
+                // out_proj: conv_y → proj [nEmb]
+                this._matmul(gl.shortconvOutProj, this._buf.convY, this._buf.proj, cl.shortconvOutProj, this.nEmb);
+            } else {
+                // --- Full attention block ---
+                this._matmul(gl.wq, this._buf.normed, this._buf.q, cl.wq, nQ);
+                this._matmul(gl.wk, this._buf.normed, this._buf.k, cl.wk, nKV);
+                this._matmul(gl.wv, this._buf.normed, this._buf.v, cl.wv, nKV);
+                this._rmsnorm(this._buf.q, gl.qNorm, nQ,  cpu.headDim);
+                this._rmsnorm(this._buf.k, gl.kNorm, nKV, cpu.headDim);
+                this._rope(this._buf.q, cpu.nHeads,  cpu.headDim, position);
+                this._rope(this._buf.k, cpu.nHeadKV, cpu.headDim, position);
+                const kvIdx = cl.attnCacheIdx;    // 0..5 (attention layers only)
+                this._storeKVGPU(kvIdx, position);
+                this._attentionGPU(kvIdx, position);
+                this._matmul(gl.wo, this._buf.attnOut, this._buf.proj, cl.wo, this.nEmb);
+            }
+
+            // Residual
+            this._addResidual(this._buf.hidden, this._buf.proj, this.nEmb);
+
+            // FFN norm
+            this._copy(this._buf.hidden, this._buf.normed, this.nEmb);
+            this._rmsnorm(this._buf.normed, gl.ffnNorm, this.nEmb);
+
+            // FFN (dense for layers 0-1, MoE for the rest)
+            if (cl.isDense) {
+                this._matmul(gl.ffnGate, this._buf.normed, this._buf.gate, cl.ffnGate, this.nFF);
+                this._matmul(gl.ffnUp,   this._buf.normed, this._buf.up,   cl.ffnUp,   this.nFF);
+                this._siluMul(this._buf.gate, this._buf.up, this.nFF);
+                this._matmul(gl.ffnDown, this._buf.gate, this._buf.down, cl.ffnDown, this.nEmb);
+                this._addResidual(this._buf.hidden, this._buf.down, this.nEmb);
+            } else {
+                this._moEFFNGPU(l, gl, cl);  // synchronous — no GPU→CPU stall
+            }
+            // No per-layer yieldToBrowser() — GPU work is async; yield only between tokens
+        }
+
+        if (!skipLogits) {
+            this._copy(this._buf.hidden, this._buf.normed, this.nEmb);
+            this._rmsnorm(this._buf.normed, this._gpuW.outputNorm, this.nEmb);
+            this._matmul(this._gpuW.output, this._buf.normed, this._buf.logits, cpu.output, this.nVocab);
+        }
+
+        // Submit all accumulated GPU commands in one shot, then read back logits
+        g.endBatch();
+
+        if (!skipLogits) {
+            const logits = await g.readF32(this._buf.logits, this.nVocab);
+            cpu.bufLogits.set(logits);
+        }
+        return skipLogits ? null : cpu.bufLogits;
+    }
+
+    // Clear GPU conv states + reset KV position counter
+    _resetGPUState() {
+        this._cpu.kvCache.reset();
+        const enc = this._gpu.device.createCommandEncoder();
+        for (let i = 0; i < this.nLayers; i++) {
+            if (this._gpuConvStates[i]) enc.clearBuffer(this._gpuConvStates[i]);
+        }
+        this._gpu.device.queue.submit([enc.finish()]);
+    }
+
+    // ---- Generation loop ----
+    async generate(tokenIds, options = {}) {
+        const {
+            maxSteps    = 512,
+            temperature = 0.7,
+            topP        = 0.9,
+            topK        = 40,
+            onToken,
+            onPrefill,
+            onFinish,
+            abortSignal,
+        } = options;
+
+        this._resetGPUState();
+
+        // Prefill: submit one batch per token (GPU works asynchronously).
+        // Sync the GPU every SYNC_EVERY tokens so onPrefill reflects actual GPU progress,
+        // not just CPU submission speed.  Without sync, all progress would show instantly
+        // and then freeze until the final readF32 forces a wait.
+        const SYNC_EVERY = 8;
+        for (let i = 0; i < tokenIds.length - 1; i++) {
+            if (abortSignal?.aborted) return;
+            await this.forward(tokenIds[i], i, true);
+            const isLast     = (i === tokenIds.length - 2);
+            const isSyncPt   = ((i + 1) % SYNC_EVERY === 0) || isLast;
+            if (isSyncPt) {
+                await this._gpu.device.queue.onSubmittedWorkDone();
+                if (onPrefill) onPrefill(i + 1, tokenIds.length);
+                await yieldToBrowser();
+            }
+        }
+
+        if (abortSignal?.aborted) return;
+        await this.forward(tokenIds[tokenIds.length - 1], tokenIds.length - 1, false);
+
+        const cpu = this._cpu;
+        const genStartPos = tokenIds.length;
+
+        let currentToken = temperature <= 0
+            ? sampleGreedy(cpu.bufLogits)
+            : sampleTopPTopK(cpu.bufLogits, temperature, topP, topK);
+
+        const generatedTokens = [];
+        for (let step = 0; step < maxSteps; step++) {
+            if (currentToken === cpu.tokenizer.eosTokenId) break;
+            if (cpu.tokenizer.stopTokenIds?.has(currentToken)) break;
+            if (abortSignal?.aborted) return;
+
+            await this.forward(currentToken, tokenIds.length + step);
+
+            // Batch-read all MoE routing data after forward pass (one Promise.all,
+            // not per-layer awaits).  Must happen before onToken so router-viz sees
+            // the data for this token when it calls commitToken().
+            if (this.onRouterUpdate) await this._readbackRoutingData();
+
+            generatedTokens.push(currentToken);
+            if (onToken) onToken(currentToken);
+
+            currentToken = temperature <= 0
+                ? sampleGreedy(cpu.bufLogits)
+                : sampleTopPTopK(cpu.bufLogits, temperature, topP, topK);
+
+            await yieldToBrowser();
+        }
+        if (onFinish) onFinish(generatedTokens);
+    }
+
+    resetKVCache() { this._resetGPUState(); }
 
     formatChat(messages, systemPrompt) {
         return this._cpu.formatChat(messages, systemPrompt);
