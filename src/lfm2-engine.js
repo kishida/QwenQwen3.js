@@ -605,11 +605,9 @@ class Lfm2Engine {
         }
         text += '<|im_start|>assistant\n';
         if (thinkingMode === 'suppress') {
-            text += '<think></think>\n';
-        } else {
-            // shorten / full: open thinking block, model generates inside it
-            text += '<think>\n';
+            text += '<think>\n\n</think>\n';
         }
+        // shorten / full: no prefix — LFM2 opens <think> naturally
         return text;
     }
 

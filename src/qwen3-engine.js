@@ -478,9 +478,8 @@ class Qwen3Engine {
         }
         text += '<|im_start|>assistant\n';
         if (thinkingMode === 'suppress') {
-            text += '<think></think>\n';
+            text += '<think>\n\n</think>\n\n';
         } else {
-            // shorten / full: open thinking block, model generates inside it
             text += '<think>\n';
         }
         return text;
