@@ -67,6 +67,13 @@ body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
     <label>Top-P: <input type="range" id="topPSlider" min="0" max="1" step="0.05" value="0.9"><span id="topPVal">0.9</span></label>
     <label>Top-K: <input type="number" id="topKInput" min="0" max="512" value="40" style="width:60px;"></label>
     <label>Max Tokens: <input type="number" id="maxTokensInput" min="1" max="4096" value="512" style="width:70px;"></label>
+    <label>Thinking:
+        <select id="thinkingMode" style="background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px 6px; border-radius:4px; font-size:0.85em;">
+            <option value="suppress">抑制</option>
+            <option value="shorten">短縮</option>
+            <option value="full">フル</option>
+        </select>
+    </label>
     <label>System: <input type="text" id="systemPrompt" placeholder="システムプロンプト (任意)" style="flex:1; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px 8px; border-radius:4px;"></label>
 </div>
 
@@ -258,8 +265,9 @@ async function sendMessage() {
     currentAbort = new AbortController();
 
     // Build chat prompt
-    const systemPrompt = document.getElementById('systemPrompt').value.trim() || null;
-    const chatText = engine.formatChat(conversationHistory, systemPrompt);
+    const systemPrompt  = document.getElementById('systemPrompt').value.trim() || null;
+    const thinkingMode  = document.getElementById('thinkingMode').value;
+    const chatText = engine.formatChat(conversationHistory, systemPrompt, thinkingMode);
     const tokenIds = engine.tokenizer.tokenize(chatText, true, false);
 
     const assistantEl = addStreamingMessage('assistant');
@@ -273,11 +281,12 @@ async function sendMessage() {
 
     try {
         await engine.generate(tokenIds, {
-            maxSteps: parseInt(document.getElementById('maxTokensInput').value) || 512,
-            temperature: parseFloat(document.getElementById('tempSlider').value),
-            topP: parseFloat(document.getElementById('topPSlider').value),
-            topK: parseInt(document.getElementById('topKInput').value) || 40,
-            abortSignal: currentAbort.signal,
+            maxSteps:     parseInt(document.getElementById('maxTokensInput').value) || 512,
+            temperature:  parseFloat(document.getElementById('tempSlider').value),
+            topP:         parseFloat(document.getElementById('topPSlider').value),
+            topK:         parseInt(document.getElementById('topKInput').value) || 40,
+            thinkingMode,
+            abortSignal:  currentAbort.signal,
             onPrefill(done, total) {
                 if (total <= 1) return;
                 const pct = Math.round(done / total * 100);

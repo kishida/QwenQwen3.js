@@ -396,14 +396,23 @@ class Qwen3Engine {
     // --- Generation loop ---
     async generate(tokenIds, options = {}) {
         const {
-            maxSteps = 512,
-            temperature = 0.7,
-            topP = 0.9,
-            topK = 40,
+            maxSteps     = 512,
+            temperature  = 0.7,
+            topP         = 0.9,
+            topK         = 40,
+            thinkingMode = 'suppress',
             onToken,
             onFinish,
             abortSignal,
         } = options;
+
+        // Qwen3: <think>=151667, </think>=151668
+        const thinkOpts = {
+            mode:         thinkingMode,
+            thinkId:      151667,
+            endThinkId:   151668,
+            thinkingDone: thinkingMode === 'suppress',
+        };
 
         this.kvCache.reset();
 
@@ -420,9 +429,7 @@ class Qwen3Engine {
         if (abortSignal?.aborted) return;
         this.forward(tokenIds[tokenIds.length - 1], tokenIds.length - 1, false /*compute logits*/);
 
-        let currentToken = temperature <= 0
-            ? sampleGreedy(this.bufLogits)
-            : sampleTopPTopK(this.bufLogits, temperature, topP, topK);
+        let currentToken = sampleWithThinkControl(this.bufLogits, temperature, topP, topK, thinkOpts);
 
         const generatedTokens = [];
 
@@ -432,6 +439,8 @@ class Qwen3Engine {
             // 特殊終了トークン（im_end）で生成停止
             if (this.tokenizer.stopTokenIds.has(currentToken)) break;
 
+            if (currentToken === thinkOpts.endThinkId) thinkOpts.thinkingDone = true;
+
             // Forward pass for this generated token at position N + step
             if (abortSignal?.aborted) return;
             this.forward(currentToken, tokenIds.length + step);
@@ -439,9 +448,7 @@ class Qwen3Engine {
             generatedTokens.push(currentToken);
             if (onToken) onToken(currentToken);
 
-            currentToken = temperature <= 0
-                ? sampleGreedy(this.bufLogits)
-                : sampleTopPTopK(this.bufLogits, temperature, topP, topK);
+            currentToken = sampleWithThinkControl(this.bufLogits, temperature, topP, topK, thinkOpts);
 
             await yieldToBrowser();
         }
@@ -450,8 +457,8 @@ class Qwen3Engine {
     }
 
     // --- Chat template formatting ---
-    formatChat(messages, systemPrompt) {
-        return this._defaultQwen3Format(messages, systemPrompt);
+    formatChat(messages, systemPrompt, thinkingMode = 'suppress') {
+        return this._defaultQwen3Format(messages, systemPrompt, thinkingMode);
         /*
         const chatTemplate = this.gguf.getKeyValue('tokenizer.chat_template');
         if (!chatTemplate) return this._defaultQwen3Format(messages, systemPrompt);
@@ -461,7 +468,7 @@ class Qwen3Engine {
         */
     }
 
-    _defaultQwen3Format(messages, systemPrompt) {
+    _defaultQwen3Format(messages, systemPrompt, thinkingMode = 'suppress') {
         let text = '';
         if (systemPrompt) {
             text += `<|im_start|>system\n${systemPrompt}<|im_end|>\n`;
@@ -470,7 +477,12 @@ class Qwen3Engine {
             text += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`;
         }
         text += '<|im_start|>assistant\n';
-        text += '<think>\n\n</think>\n\n'; // if thinking on, add just '<think>\n'
+        if (thinkingMode === 'suppress') {
+            text += '<think></think>\n';
+        } else {
+            // shorten / full: open thinking block, model generates inside it
+            text += '<think>\n';
+        }
         return text;
     }
 

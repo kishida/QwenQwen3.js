@@ -522,15 +522,24 @@ class Lfm2Engine {
 
     async generate(tokenIds, options = {}) {
         const {
-            maxSteps    = 512,
-            temperature = 0.7,
-            topP        = 0.9,
-            topK        = 40,
+            maxSteps     = 512,
+            temperature  = 0.7,
+            topP         = 0.9,
+            topK         = 40,
+            thinkingMode = 'suppress',
             onToken,
             onPrefill,
             onFinish,
             abortSignal,
         } = options;
+
+        // LFM2: <think>=124901, </think>=124902
+        const thinkOpts = {
+            mode:         thinkingMode,
+            thinkId:      124901,
+            endThinkId:   124902,
+            thinkingDone: thinkingMode === 'suppress',
+        };
 
         // Reset KV cache + conv states for a fresh generation
         this.resetState();
@@ -549,9 +558,7 @@ class Lfm2Engine {
         if (abortSignal?.aborted) return;
         this.forward(tokenIds[tokenIds.length - 1], tokenIds.length - 1, false);
 
-        let currentToken = temperature <= 0
-            ? sampleGreedy(this.bufLogits)
-            : sampleTopPTopK(this.bufLogits, temperature, topP, topK);
+        let currentToken = sampleWithThinkControl(this.bufLogits, temperature, topP, topK, thinkOpts);
 
         const generatedTokens = [];
 
@@ -559,15 +566,15 @@ class Lfm2Engine {
             if (currentToken === this.tokenizer.eosTokenId) break;
             if (this.tokenizer.stopTokenIds?.has(currentToken)) break;
 
+            if (currentToken === thinkOpts.endThinkId) thinkOpts.thinkingDone = true;
+
             if (abortSignal?.aborted) return;
             this.forward(currentToken, tokenIds.length + step);
 
             generatedTokens.push(currentToken);
             if (onToken) onToken(currentToken);
 
-            currentToken = temperature <= 0
-                ? sampleGreedy(this.bufLogits)
-                : sampleTopPTopK(this.bufLogits, temperature, topP, topK);
+            currentToken = sampleWithThinkControl(this.bufLogits, temperature, topP, topK, thinkOpts);
 
             await yieldToBrowser();
         }
@@ -577,16 +584,16 @@ class Lfm2Engine {
 
     // ---- Chat template ----
 
-    formatChat(messages, systemPrompt) {
+    formatChat(messages, systemPrompt, thinkingMode = 'suppress') {
         // LFM2's GGUF chat template uses macros, namespace(), filters, bracket indexing,
         // loop.index0, etc. — too complex to render dynamically.
         // The template produces standard ChatML for simple chat (no tools),
         // so we hardcode that directly.
-        return this._chatML(messages, systemPrompt);
+        return this._chatML(messages, systemPrompt, thinkingMode);
     }
 
     // LFM2 uses ChatML format: <|im_start|>role\ncontent<|im_end|>\n
-    _chatML(messages, systemPrompt) {
+    _chatML(messages, systemPrompt, thinkingMode = 'suppress') {
         let text = '<|startoftext|>';
         if (systemPrompt) {
             text += `<|im_start|>system\n${systemPrompt}<|im_end|>\n`;
@@ -596,7 +603,13 @@ class Lfm2Engine {
             const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
             text += `<|im_start|>${role}\n${content}<|im_end|>\n`;
         }
-        text += '<|im_start|>assistant\n<think>\n\n</think>\n';
+        text += '<|im_start|>assistant\n';
+        if (thinkingMode === 'suppress') {
+            text += '<think></think>\n';
+        } else {
+            // shorten / full: open thinking block, model generates inside it
+            text += '<think>\n';
+        }
         return text;
     }
 

@@ -1893,15 +1893,24 @@ class Lfm2GPUEngine {
     // ---- Generation loop ----
     async generate(tokenIds, options = {}) {
         const {
-            maxSteps    = 512,
-            temperature = 0.7,
-            topP        = 0.9,
-            topK        = 40,
+            maxSteps     = 512,
+            temperature  = 0.7,
+            topP         = 0.9,
+            topK         = 40,
+            thinkingMode = 'suppress',
             onToken,
             onPrefill,
             onFinish,
             abortSignal,
         } = options;
+
+        // LFM2: <think>=124901, </think>=124902
+        const thinkOpts = {
+            mode:         thinkingMode,
+            thinkId:      124901,
+            endThinkId:   124902,
+            thinkingDone: thinkingMode === 'suppress',
+        };
 
         this._resetGPUState();
 
@@ -1926,17 +1935,16 @@ class Lfm2GPUEngine {
         await this.forward(tokenIds[tokenIds.length - 1], tokenIds.length - 1, false);
 
         const cpu = this._cpu;
-        const genStartPos = tokenIds.length;
 
-        let currentToken = temperature <= 0
-            ? sampleGreedy(cpu.bufLogits)
-            : sampleTopPTopK(cpu.bufLogits, temperature, topP, topK);
+        let currentToken = sampleWithThinkControl(cpu.bufLogits, temperature, topP, topK, thinkOpts);
 
         const generatedTokens = [];
         for (let step = 0; step < maxSteps; step++) {
             if (currentToken === cpu.tokenizer.eosTokenId) break;
             if (cpu.tokenizer.stopTokenIds?.has(currentToken)) break;
             if (abortSignal?.aborted) return;
+
+            if (currentToken === thinkOpts.endThinkId) thinkOpts.thinkingDone = true;
 
             await this.forward(currentToken, tokenIds.length + step);
 
@@ -1948,9 +1956,7 @@ class Lfm2GPUEngine {
             generatedTokens.push(currentToken);
             if (onToken) onToken(currentToken);
 
-            currentToken = temperature <= 0
-                ? sampleGreedy(cpu.bufLogits)
-                : sampleTopPTopK(cpu.bufLogits, temperature, topP, topK);
+            currentToken = sampleWithThinkControl(cpu.bufLogits, temperature, topP, topK, thinkOpts);
 
             await yieldToBrowser();
         }
@@ -1959,7 +1965,7 @@ class Lfm2GPUEngine {
 
     resetKVCache() { this._resetGPUState(); }
 
-    formatChat(messages, systemPrompt) {
-        return this._cpu.formatChat(messages, systemPrompt);
+    formatChat(messages, systemPrompt, thinkingMode = 'suppress') {
+        return this._cpu.formatChat(messages, systemPrompt, thinkingMode);
     }
 }

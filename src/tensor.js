@@ -236,6 +236,34 @@ function sampleGreedy(logits) {
     return maxIdx;
 }
 
+// --- Thinking-mode controlled sampling ---
+// thinkOpts: { mode: 'suppress'|'shorten'|'full', thinkId, endThinkId, thinkingDone }
+//   suppress: block <think> from being sampled
+//   shorten:  if </think> is in top-K, force it (while thinkingDone=false)
+//   full:     no control
+function sampleWithThinkControl(logits, temperature, topP, topK, thinkOpts) {
+    const mode = thinkOpts?.mode ?? 'suppress';
+
+    if (mode === 'suppress') {
+        logits[thinkOpts.thinkId] = -Infinity;
+    } else if (mode === 'shorten' && !thinkOpts.thinkingDone) {
+        // Force </think> if it ranks within top-K
+        const endLogit = logits[thinkOpts.endThinkId];
+        let rank = 0;
+        const n = logits.length;
+        for (let i = 0; i < n; i++) {
+            if (logits[i] > endLogit) {
+                if (++rank >= topK) break;
+            }
+        }
+        if (rank < topK) return thinkOpts.endThinkId;
+    }
+
+    return temperature <= 0
+        ? sampleGreedy(logits)
+        : sampleTopPTopK(logits, temperature, topP, topK);
+}
+
 // === k-quant CPU dequantization (Q2_K through Q6_K) ===
 // All k-quants: QK_K=256 elements per superblock, column-major storage
 
