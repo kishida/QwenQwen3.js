@@ -517,22 +517,38 @@ class Qwen3GPUEngine {
         eng.kvCache   = eng._cpu.kvCache;
         eng.tokenizer = eng._cpu.tokenizer;
         eng.isMoE     = eng._cpu.isMoE;
-        eng.layers    = eng._cpu.layers;  // needed for nExperts, nExpertsUsed per layer
+        eng.layers    = eng._cpu.layers;
+        // MoE params (from first MoE layer, same for all)
+        const firstMoE = eng._cpu.layers.find(l => l.isMoE);
+        eng.nExperts     = firstMoE?.nExperts     ?? 128;
+        eng.nExpertsUsed = firstMoE?.nExpertsUsed ?? 8;
+        eng.onRouterUpdate    = null;
+        eng.expertMask        = null;
+        eng.batchRouterUpdate = true;
+        eng._gpuRoutingBufs     = [];
+        eng._moeAbsLayerIndices = [];
 
         // Create pipelines (async — surfaces WGSL compile errors with line numbers)
         console.log('[GPU] Compiling shaders...');
-        const [matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy, attention, axpy] = await Promise.all([
-            eng._gpu.getOrCreatePipeline('matmul_q8_0',  WGSL_MATMUL_Q8_0),
-            eng._gpu.getOrCreatePipeline('matmul_kquant', WGSL_MATMUL_KQUANT),
-            eng._gpu.getOrCreatePipeline('rmsnorm',       WGSL_RMSNORM),
-            eng._gpu.getOrCreatePipeline('rope',          WGSL_ROPE),
-            eng._gpu.getOrCreatePipeline('silu_mul',      WGSL_ELEMENTWISE, 'silu_mul'),
-            eng._gpu.getOrCreatePipeline('add_residual',  WGSL_ELEMENTWISE, 'add_residual'),
-            eng._gpu.getOrCreatePipeline('copy',          WGSL_COPY),
-            eng._gpu.getOrCreatePipeline('attention',     WGSL_ATTENTION),
-            eng._gpu.getOrCreatePipeline('axpy',          WGSL_AXPY),
+        const [matmulQ80, matmulKQ, matmulF32, rmsnorm, rope, siluMul, addResidual, copy, attention, axpy,
+               moeSoftmaxTopK, matmulExpertQ80, matmulExpertKQ, axpyExpert] = await Promise.all([
+            eng._gpu.getOrCreatePipeline('matmul_q8_0',          WGSL_MATMUL_Q8_0),
+            eng._gpu.getOrCreatePipeline('matmul_kquant',         WGSL_MATMUL_KQUANT),
+            eng._gpu.getOrCreatePipeline('matmul_f32',            WGSL_MATMUL_F32),
+            eng._gpu.getOrCreatePipeline('rmsnorm',               WGSL_RMSNORM),
+            eng._gpu.getOrCreatePipeline('rope',                  WGSL_ROPE),
+            eng._gpu.getOrCreatePipeline('silu_mul',              WGSL_ELEMENTWISE, 'silu_mul'),
+            eng._gpu.getOrCreatePipeline('add_residual',          WGSL_ELEMENTWISE, 'add_residual'),
+            eng._gpu.getOrCreatePipeline('copy',                  WGSL_COPY),
+            eng._gpu.getOrCreatePipeline('attention',             WGSL_ATTENTION),
+            eng._gpu.getOrCreatePipeline('axpy',                  WGSL_AXPY),
+            eng._gpu.getOrCreatePipeline('moe_softmax_topk',      WGSL_MOE_SOFTMAX_TOPK),
+            eng._gpu.getOrCreatePipeline('matmul_expert_q80',     WGSL_MATMUL_EXPERT_Q80),
+            eng._gpu.getOrCreatePipeline('matmul_expert_kquant',  WGSL_MATMUL_EXPERT_KQUANT),
+            eng._gpu.getOrCreatePipeline('axpy_expert',           WGSL_AXPY_EXPERT),
         ]);
-        eng._pipelines = { matmulQ80, matmulKQ, rmsnorm, rope, siluMul, addResidual, copy, attention, axpy };
+        eng._pipelines = { matmulQ80, matmulKQ, matmulF32, rmsnorm, rope, siluMul, addResidual, copy, attention, axpy,
+                           moeSoftmaxTopK, matmulExpertQ80, matmulExpertKQ, axpyExpert };
         console.log('[GPU] Shaders compiled OK.');
 
         // Upload weight tensors to GPU
@@ -585,13 +601,24 @@ class Qwen3GPUEngine {
                 ffnDown: upload(l.ffnDown),
                 // MoE
                 isMoE: l.isMoE,
-                routerWeight:  l.routerWeight,  // keep CPU ref (F32, small)
-                ffnGateExps: upload(l.ffnGateExps),
-                ffnUpExps:   upload(l.ffnUpExps),
-                ffnDownExps: upload(l.ffnDownExps),
                 // Original CPU meta for type/shape info
                 _cpuLayer: l,
             });
+
+            // MoE: upload router weight + create routing result buffer
+            if (l.isMoE) {
+                const gl = this._gpuW.layers[i];
+                const moeIdx = this._gpuRoutingBufs.length;
+                gl._moeIdx = moeIdx;
+                this._moeAbsLayerIndices.push(i);
+                gl.routerWeightGPU = upload(l.routerWeight);
+                gl.ffnGateExps = upload(l.ffnGateExps);
+                gl.ffnUpExps   = upload(l.ffnUpExps);
+                gl.ffnDownExps = upload(l.ffnDownExps);
+                const resultFloats = 2 * l.nExpertsUsed + l.nExperts;
+                this._gpuRoutingBufs.push(g.createBuffer(resultFloats * 4));
+            }
+
             if (i % 4 === 0) await yieldToBrowser();
         }
     }
@@ -607,11 +634,12 @@ class Qwen3GPUEngine {
             v:         f32(this.nKV),
             attnOut:   f32(this.nQ),
             proj:      f32(this.nEmb),
-            gate:      f32(this.nFF),
-            up:        f32(this.nFF),
-            down:      f32(this.nEmb),
-            moeAcc:    f32(this.nEmb),
-            logits:    f32(this.nVocab),
+            gate:         f32(this.nFF),
+            up:           f32(this.nFF),
+            down:         f32(this.nEmb),
+            moeAcc:       f32(this.nEmb),
+            routerLogits: f32(this.nExperts),
+            logits:       f32(this.nVocab),
         };
     }
 
@@ -630,13 +658,20 @@ class Qwen3GPUEngine {
         console.log(`[GPU] KV cache: ${this.nLayers}L × 2 × ${(kvBytes/1024).toFixed(0)} KB = ${totalMB} MB`);
     }
 
-    // ---- GPU helper: dispatch matmul (handles Q8_0 and k-quants) ----
+    // ---- GPU helper: dispatch matmul (handles F32, Q8_0 and k-quants) ----
     _matmul(weightBuf, inputBuf, outputBuf, meta, outDim) {
         const g = this._gpu;
         const inDim = meta.shape[0];
         const type = meta.type;
 
-        if (type === 8) {
+        if (type === 0) {
+            // F32 (router weights)
+            const uBuf = g.createUniformBuffer(new Uint32Array([inDim, outDim]));
+            g.dispatch(this._pipelines.matmulF32,
+                [g.buf(weightBuf), g.buf(inputBuf), g.buf(outputBuf), g.ubuf(uBuf)],
+                Math.ceil(outDim / 256));
+            uBuf.destroy();
+        } else if (type === 8) {
             // Q8_0
             const uBuf = g.createUniformBuffer(new Uint32Array([inDim, outDim]));
             g.dispatch(this._pipelines.matmulQ80,
@@ -815,7 +850,7 @@ class Qwen3GPUEngine {
 
             // --- FFN (dense or MoE) ---
             if (cl.isMoE) {
-                await this._moEFFNGPU(l, gl, cl, position);
+                this._moEFFNGPU(l, gl, cl);  // synchronous — no GPU→CPU stall
             } else {
                 this._matmul(gl.ffnGate, this._buf.normed, this._buf.gate, cl.ffnGate, this.nFF);
                 this._matmul(gl.ffnUp,   this._buf.normed, this._buf.up,   cl.ffnUp,   this.nFF);
@@ -839,82 +874,119 @@ class Qwen3GPUEngine {
         return skipLogits ? null : cpu.bufLogits;
     }
 
-    // ---- MoE FFN on GPU (router on CPU, expert matmuls on GPU) ----
-    async _moEFFNGPU(layerIdx, gl, cl, position) {
+    // ---- MoE FFN fully on GPU (zero CPU roundtrips) ----
+    _moEFFNGPU(layerIdx, gl, cl) {
+        const g   = this._gpu;
+        const moeIdx = gl._moeIdx;
+
+        // 1. Router matmul: normed → routerLogits
+        this._matmul(gl.routerWeightGPU, this._buf.normed, this._buf.routerLogits,
+                     cl.routerWeight, this.nExperts);
+
+        // 2. Softmax + top-K → routing buffer
+        this._moeSoftmaxTopK(moeIdx);
+
+        // 3. Clear MoE accumulator
+        const clearEnc = g._batchEnc ?? g.device.createCommandEncoder();
+        clearEnc.clearBuffer(this._buf.moeAcc);
+        if (!g._batchEnc) g.device.queue.submit([clearEnc.finish()]);
+
+        const topK   = this.nExpertsUsed;
+        const hidDim = cl.ffnGateExps.shape[1];
+        const inDim  = cl.ffnGateExps.shape[0];
+
+        // 4. Expert matmuls — expert indices resolved GPU-side from routing buffer
+        for (let k = 0; k < topK; k++) {
+            this._matmulExpert(k, moeIdx, gl.ffnGateExps, this._buf.normed, this._buf.gate,
+                               cl.ffnGateExps, hidDim, inDim);
+            this._matmulExpert(k, moeIdx, gl.ffnUpExps,   this._buf.normed, this._buf.up,
+                               cl.ffnUpExps,   hidDim, inDim);
+            this._siluMul(this._buf.gate, this._buf.up, hidDim);
+            this._matmulExpert(k, moeIdx, gl.ffnDownExps, this._buf.gate, this._buf.down,
+                               cl.ffnDownExps, this.nEmb, hidDim);
+            this._axpyExpert(k, topK, moeIdx, this._buf.moeAcc, this._buf.down, this.nEmb);
+        }
+
+        this._addResidual(this._buf.hidden, this._buf.moeAcc, this.nEmb);
+        // No await — zero GPU→CPU sync during forward pass
+    }
+
+    _moeSoftmaxTopK(moeIdx) {
         const g = this._gpu;
+        const params = new Uint32Array([this.nExperts, this.nExpertsUsed, 0, 0]);
+        const pBuf = g.createUniformBuffer(params);
+        g.dispatch(this._pipelines.moeSoftmaxTopK, [
+            g.buf(this._buf.routerLogits),
+            g.buf(this._gpuRoutingBufs[moeIdx]),
+            g.ubuf(pBuf),
+        ], 1);
+        g.deferDestroy(pBuf);
+    }
 
-        // Read normed hidden for router (CPU F32 matmul)
-        const normedCPU = await g.readF32(this._buf.normed, this.nEmb);
+    _bytesPerExpert(cpuMeta, outDim, inDim) {
+        const blockBytes    = this._cpu._blockSizeForType(cpuMeta.type);
+        const elemsPerBlock = cpuMeta.type >= 10 ? 256 : 32;
+        const blocksPerCol  = Math.ceil(inDim / elemsPerBlock);
+        return outDim * blocksPerCol * blockBytes;
+    }
 
-        // Router: F32 matmul on CPU
-        const routerLogits = matmulGeneric(cl.routerWeight, normedCPU);
-        softmaxInPlace(routerLogits, 0, routerLogits.length);
+    _matmulExpert(slotK, moeIdx, gpuWeightBuf, inputBuf, outputBuf, cpuMeta, outDim, inDim) {
+        const g    = this._gpu;
+        const type = cpuMeta.type;
+        const bpe  = this._bytesPerExpert(cpuMeta, outDim, inDim);
+        const routingBuf = this._gpuRoutingBufs[moeIdx];
+        if (type === 8) {
+            const pBuf = g.createUniformBuffer(new Uint32Array([inDim, outDim, slotK, bpe]));
+            g.dispatch(this._pipelines.matmulExpertQ80, [
+                g.buf(gpuWeightBuf), g.buf(inputBuf), g.buf(outputBuf),
+                g.ubuf(pBuf), g.buf(routingBuf),
+            ], Math.ceil(outDim / 256));
+            g.deferDestroy(pBuf);
+        } else if (type >= 10 && type <= 14) {
+            const blockBytes = [0,0,0,0,0,0,0,0,0,0, 84,110,144,176,210][type];
+            const pBuf = g.createUniformBuffer(
+                new Uint32Array([inDim, outDim, type, blockBytes, slotK, bpe, 0, 0]));
+            g.dispatch(this._pipelines.matmulExpertKQ, [
+                g.buf(gpuWeightBuf), g.buf(inputBuf), g.buf(outputBuf),
+                g.ubuf(pBuf), g.buf(routingBuf),
+            ], Math.ceil(outDim / 256));
+            g.deferDestroy(pBuf);
+        } else {
+            throw new Error(`Qwen3GPU expert matmul: unsupported weight type ${type}`);
+        }
+    }
 
-        // Top-K selection
-        const topK = cl.nExpertsUsed;
-        const sorted = Array.from(routerLogits).map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]);
-        const topIndices = sorted.slice(0, topK).map(x => x[1]);
-        const topWeights = sorted.slice(0, topK).map(x => x[0]);
-        let sumW = topWeights.reduce((a, b) => a + b, 0);
-        const invSum = sumW > 0 ? 1 / sumW : 0;
+    _axpyExpert(slotK, topK, moeIdx, accBuf, addBuf, n) {
+        const g = this._gpu;
+        const pBuf = g.createUniformBuffer(new Uint32Array([n, slotK, topK, 0]));
+        g.dispatch(this._pipelines.axpyExpert, [
+            g.buf(accBuf), g.buf(addBuf),
+            g.ubuf(pBuf), g.buf(this._gpuRoutingBufs[moeIdx]),
+        ], Math.ceil(n / 256));
+        g.deferDestroy(pBuf);
+    }
 
-        // Notify visualization
-        if (this.onRouterUpdate) {
+    async _readbackRoutingData() {
+        if (!this.onRouterUpdate) return;
+        const topK     = this.nExpertsUsed;
+        const nExperts = this.nExperts;
+        const results  = await Promise.all(
+            this._gpuRoutingBufs.map(buf => this._gpu.readF32(buf, 2 * topK + nExperts))
+        );
+        for (let m = 0; m < results.length; m++) {
+            const res      = results[m];
+            const selected = Array.from({ length: topK }, (_, k) => Math.round(res[k]));
+            const weights  = Array.from({ length: topK }, (_, k) => res[topK + k]);
+            const probs    = Array.from(res.subarray(2 * topK, 2 * topK + nExperts));
             this.onRouterUpdate({
-                layer: layerIdx,
-                probs: Array.from(routerLogits),
-                selected: topIndices,
-                weights: topWeights.map(w => w * invSum),
+                layer:    this._moeAbsLayerIndices[m],
+                probs, selected, weights,
             });
         }
-
-        // Clear MoE accumulator on GPU
-        const enc0 = g.device.createCommandEncoder();
-        enc0.clearBuffer(this._buf.moeAcc);
-        g.device.queue.submit([enc0.finish()]);
-
-        const hidDim = cl.ffnGateExps.shape[1];  // expert hidden dim (e.g. 768)
-        const inDim  = cl.ffnGateExps.shape[0];  // input dim (e.g. 2048)
-
-        for (let k = 0; k < topK; k++) {
-            const expertIdx = topIndices[k];
-            if (this.expertMask && this.expertMask.has(expertIdx)) continue;
-            const w = topWeights[k] * invSum;
-
-            // Get GPU buffer slices for this expert
-            const gateSlice = this._expertGPUSlice(gl.ffnGateExps, cl.ffnGateExps, expertIdx, hidDim, inDim);
-            const upSlice   = this._expertGPUSlice(gl.ffnUpExps,   cl.ffnUpExps,   expertIdx, hidDim, inDim);
-            const downSlice = this._expertGPUSlice(gl.ffnDownExps, cl.ffnDownExps, expertIdx, this.nEmb, hidDim);
-
-            // gate = matmul(normed, gate_exps_expert)
-            this._matmulSlice(gateSlice.buf, gateSlice.offset, this._buf.normed, this._buf.gate, cl.ffnGateExps, hidDim, inDim);
-            // up  = matmul(normed, up_exps_expert)
-            this._matmulSlice(upSlice.buf, upSlice.offset, this._buf.normed, this._buf.up, cl.ffnUpExps, hidDim, inDim);
-            // silu(gate) * up
-            this._siluMul(this._buf.gate, this._buf.up, hidDim);
-            // down = matmul(gate, down_exps_expert)
-            this._matmulSlice(downSlice.buf, downSlice.offset, this._buf.gate, this._buf.down, cl.ffnDownExps, this.nEmb, hidDim);
-
-            // Accumulate: moeAcc += w * down — fully on GPU, no CPU roundtrip
-            this._axpy(this._buf.moeAcc, this._buf.down, this.nEmb, w);
-        }
-
-        // Add MoE output to hidden
-        this._addResidual(this._buf.hidden, this._buf.moeAcc, this.nEmb);
     }
 
-    _expertGPUSlice(gpuBuf, cpuMeta, expertIdx, outDim, inDim) {
-        const blockBytes = this._cpu._blockSizeForType(cpuMeta.type);
-        const elemsPerBlock = cpuMeta.type >= 10 ? 256 : 32;
-        const blocksPerCol = Math.ceil(inDim / elemsPerBlock);
-        const bytesPerExpert = outDim * blocksPerCol * blockBytes;
-        return { buf: gpuBuf, offset: expertIdx * bytesPerExpert };
-    }
-
-    // Dispatch matmul using a slice of a larger GPU buffer (with byte offset)
+    // (legacy — kept for compatibility, no longer used)
     _matmulSlice(gpuBuf, byteOffset, inputBuf, outputBuf, cpuMeta, outDim, inDim) {
-        // For now, fall back to CPU for sliced matmuls (GPU version needs offset support)
-        // TODO: implement GPU-side offset support in the shader (pass byteOffset as uniform)
         const g = this._gpu;
         const type = cpuMeta.type;
         const blockBytes = [0,0,0,0,0,0,0,0,34,0, 84,110,144,176,210][type];
@@ -959,33 +1031,48 @@ class Qwen3GPUEngine {
     // ============================================================
     async generate(tokenIds, options = {}) {
         const {
-            maxSteps = 512,
-            temperature = 0.7,
-            topP = 0.9,
-            topK = 40,
+            maxSteps     = 512,
+            temperature  = 0.7,
+            topP         = 0.9,
+            topK         = 40,
+            thinkingMode = 'suppress',
             onToken,
+            onPrefill,
             onFinish,
             abortSignal,
         } = options;
+
+        // Qwen3: <think>=151667, </think>=151668
+        const thinkOpts = {
+            mode:         thinkingMode,
+            thinkId:      151667,
+            endThinkId:   151668,
+            thinkingDone: thinkingMode === 'suppress',
+        };
 
         // GPU KV cache is overwritten from position 0 each generate() call;
         // no explicit clear needed since positions are always written before read.
         // CPU KV cache reset (kept for compatibility but not used by GPU attention)
         this.kvCache.reset();
 
+        const SYNC_EVERY = 8;
         for (let i = 0; i < tokenIds.length - 1; i++) {
             if (abortSignal?.aborted) return;
             await this.forward(tokenIds[i], i, true);
-            if (i % 8 === 0 && tokenIds.length > 16) await yieldToBrowser();
+            const isLast   = (i === tokenIds.length - 2);
+            const isSyncPt = ((i + 1) % SYNC_EVERY === 0) || isLast;
+            if (isSyncPt) {
+                await this._gpu.device.queue.onSubmittedWorkDone();
+                if (onPrefill) onPrefill(i + 1, tokenIds.length);
+                await yieldToBrowser();
+            }
         }
 
         if (abortSignal?.aborted) return;
         await this.forward(tokenIds[tokenIds.length - 1], tokenIds.length - 1, false);
 
         const cpu = this._cpu;
-        let currentToken = temperature <= 0
-            ? sampleGreedy(cpu.bufLogits)
-            : sampleTopPTopK(cpu.bufLogits, temperature, topP, topK);
+        let currentToken = sampleWithThinkControl(cpu.bufLogits, temperature, topP, topK, thinkOpts);
 
         const generatedTokens = [];
         for (let step = 0; step < maxSteps; step++) {
@@ -993,21 +1080,25 @@ class Qwen3GPUEngine {
             if (cpu.tokenizer.stopTokenIds.has(currentToken)) break;
             if (abortSignal?.aborted) return;
 
+            if (currentToken === thinkOpts.endThinkId) thinkOpts.thinkingDone = true;
+
             await this.forward(currentToken, tokenIds.length + step);
+
+            // Batch-read MoE routing data (one Promise.all, not per-layer)
+            if (this.onRouterUpdate) await this._readbackRoutingData();
+
             generatedTokens.push(currentToken);
             if (onToken) onToken(currentToken);
 
-            currentToken = temperature <= 0
-                ? sampleGreedy(cpu.bufLogits)
-                : sampleTopPTopK(cpu.bufLogits, temperature, topP, topK);
+            currentToken = sampleWithThinkControl(cpu.bufLogits, temperature, topP, topK, thinkOpts);
 
             await yieldToBrowser();
         }
         if (onFinish) onFinish(generatedTokens);
     }
 
-    formatChat(messages, systemPrompt) {
-        return this._cpu.formatChat(messages, systemPrompt);
+    formatChat(messages, systemPrompt, thinkingMode = 'suppress') {
+        return this._cpu.formatChat(messages, systemPrompt, thinkingMode);
     }
 }
 
@@ -1076,6 +1167,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         dot += weight[base + i] * in_vec[i];
     }
     out_vec[c] = dot;
+}`;
+
+// ============================================================
+//  WGSL Shader: MoE softmax routing + top-K (GPU-only, Qwen3)
+//  Computes: softmax(logits), selects top-K, normalizes weights.
+//  Result buffer layout (same as sigmoid variant):
+//    [0..topK-1]           = selected expert indices (f32)
+//    [topK..2*topK-1]      = normalized weights (f32)
+//    [2*topK..2*topK+nE-1] = all softmax probs (f32, for viz)
+//  Supports up to 256 experts (workgroup size 256).
+// ============================================================
+const WGSL_MOE_SOFTMAX_TOPK = /* wgsl */`
+struct STP { nExperts: u32, topK: u32, _p1: u32, _p2: u32 }
+@group(0) @binding(0) var<storage, read>       logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write>  result: array<f32>;
+@group(0) @binding(2) var<uniform>              p:      STP;
+
+var<workgroup> wg_probs: array<f32, 256>;
+var<workgroup> wg_sel:   array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let e  = lid.x;
+    let nE = p.nExperts;
+    if (e < nE) {
+        wg_probs[e] = logits[e];
+    } else {
+        wg_probs[e] = -1e38;
+    }
+    workgroupBarrier();
+    if (e != 0u) { return; }
+    // Thread 0: softmax + top-K (nE ≤ 256)
+    var maxV: f32 = -1e38;
+    for (var i = 0u; i < nE; i++) {
+        if (wg_probs[i] > maxV) { maxV = wg_probs[i]; }
+    }
+    var sumExp: f32 = 0.0;
+    for (var i = 0u; i < nE; i++) {
+        let ev = exp(wg_probs[i] - maxV);
+        wg_probs[i] = ev;
+        sumExp += ev;
+    }
+    let invS = 1.0 / sumExp;
+    for (var i = 0u; i < nE; i++) {
+        wg_probs[i] *= invS;
+        wg_sel[i]    = wg_probs[i];
+    }
+    var sumW: f32 = 1e-6;
+    for (var k = 0u; k < p.topK; k++) {
+        var best: f32 = -1e38;
+        var bestI: u32 = 0u;
+        for (var i = 0u; i < nE; i++) {
+            if (wg_sel[i] > best) { best = wg_sel[i]; bestI = i; }
+        }
+        result[k]          = f32(bestI);
+        result[p.topK + k] = wg_probs[bestI];
+        sumW              += wg_probs[bestI];
+        wg_sel[bestI]      = -1e38;
+    }
+    let inv = 1.0 / sumW;
+    for (var k = 0u; k < p.topK; k++) { result[p.topK + k] *= inv; }
+    for (var i = 0u; i < nE; i++) { result[2u * p.topK + i] = wg_probs[i]; }
 }`;
 
 // ============================================================
