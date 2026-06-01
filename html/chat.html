@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html>
 <head>
 <meta charset="UTF-8">
 <title>LLM Chat</title>
@@ -17,6 +17,10 @@ body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 #modelStatus { font-size: 0.8em; color: #8b949e; margin-left: auto; }
+#langToggle { font-size: 0.8em; color: #8b949e; display: flex; gap: 2px; align-items: center; }
+#langToggle span { cursor: pointer; padding: 2px 5px; border-radius: 4px; }
+#langToggle span.active { color: #58a6ff; font-weight: bold; }
+#langToggle span:hover:not(.active) { color: #c9d1d9; }
 #modelStatus.ready { color: #3fb950; }
 
 #progressBar { width: 200px; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; display: none; }
@@ -54,12 +58,13 @@ body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
 
 <div id="header">
     <h1 id="appTitle">LLM Chat</h1>
-    <button class="btn" onclick="document.getElementById('fileInput').click()">📂 GGUF読み込み</button>
+    <button class="btn" id="loadBtn" onclick="document.getElementById('fileInput').click()">📂 GGUF読み込み</button>
     <input type="file" id="fileInput" accept=".gguf">
     <div id="progressBar"><div id="progressFill"></div></div>
     <span id="modelStatus">モデル未読込</span>
     <button class="btn" id="resetBtn" onclick="resetChat()" style="margin-left:auto;" disabled>🗑 リセット</button>
-    <button class="btn" onclick="toggleSettings()">⚙ 設定</button>
+    <button class="btn" id="settingsBtn" onclick="toggleSettings()">⚙ 設定</button>
+    <div id="langToggle"><span id="langEN" onclick="setLang('en')">EN</span><span style="color:#444">|</span><span id="langJA" onclick="setLang('ja')">JA</span></div>
 </div>
 
 <div id="settings">
@@ -67,14 +72,14 @@ body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
     <label>Top-P: <input type="range" id="topPSlider" min="0" max="1" step="0.05" value="0.9"><span id="topPVal">0.9</span></label>
     <label>Top-K: <input type="number" id="topKInput" min="0" max="512" value="40" style="width:60px;"></label>
     <label>Max Tokens: <input type="number" id="maxTokensInput" min="1" max="4096" value="512" style="width:70px;"></label>
-    <label>Thinking:
+    <label id="thinkingLabel">Thinking:
         <select id="thinkingMode" style="background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px 6px; border-radius:4px; font-size:0.85em;">
             <option value="suppress">抑制</option>
             <option value="shorten">短縮</option>
             <option value="full">フル</option>
         </select>
     </label>
-    <label>System: <input type="text" id="systemPrompt" placeholder="システムプロンプト (任意)" style="flex:1; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px 8px; border-radius:4px;"></label>
+    <label id="systemLabel">System: <input type="text" id="systemPrompt" placeholder="システムプロンプト (任意)" style="flex:1; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:2px 8px; border-radius:4px;"></label>
 </div>
 
 <div id="chatContainer"></div>
@@ -83,6 +88,7 @@ body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
     <textarea id="messageInput" rows="1" placeholder="メッセージを入力..." disabled></textarea>
     <button class="btn primary" id="sendBtn" onclick="handleSendClick()" disabled>送信</button>
     <button class="btn" id="stopBtn" onclick="stopGeneration()" style="display:none;">停止</button>
+
 </div>
 
 <div id="statsBar"></div>
@@ -96,6 +102,79 @@ body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
 <script src="../src/webgpu.js"></script>
 
 <script>
+// --- i18n ---
+const I18N = {
+    ja: {
+        loadBtn:        '📂 GGUF読み込み',
+        noModel:        'モデル未読込',
+        resetBtn:       '🗑 リセット',
+        settingsBtn:    '⚙ 設定',
+        thinkingLabel:  'Thinking:',
+        thinkSuppress:  '抑制',
+        thinkShorten:   '短縮',
+        thinkFull:      'フル',
+        systemLabel:    'System:',
+        systemPh:       'システムプロンプト (任意)',
+        inputPh:        'メッセージを入力...',
+        sendBtn:        '送信',
+        stopBtn:        '停止',
+        loading:        '読み込み中...',
+        ready:          '準備OK',
+        prefilling:     (d, t, p) => `⏳ prefill中... ${d}/${t} tokens (${p}%)`,
+        stats:          (n, s, t) => `⚡ ${n} tokens / ${s}s (${t} tok/s)`,
+        genError:       '生成エラー:',
+        inlineError:    (m) => ` [エラー: ${m}]`,
+        loadError:      'エラー:',
+    },
+    en: {
+        loadBtn:        '📂 Load GGUF',
+        noModel:        'No model loaded',
+        resetBtn:       '🗑 Reset',
+        settingsBtn:    '⚙ Settings',
+        thinkingLabel:  'Thinking:',
+        thinkSuppress:  'Suppress',
+        thinkShorten:   'Shorten',
+        thinkFull:      'Full',
+        systemLabel:    'System:',
+        systemPh:       'System prompt (optional)',
+        inputPh:        'Type a message...',
+        sendBtn:        'Send',
+        stopBtn:        'Stop',
+        loading:        'Loading...',
+        ready:          'Ready',
+        prefilling:     (d, t, p) => `⏳ Prefilling... ${d}/${t} tokens (${p}%)`,
+        stats:          (n, s, t) => `⚡ ${n} tokens / ${s}s (${t} tok/s)`,
+        genError:       'Generation error:',
+        inlineError:    (m) => ` [Error: ${m}]`,
+        loadError:      'Error:',
+    },
+};
+
+let lang = navigator.language?.startsWith('ja') ? 'ja' : 'en';
+let T = I18N[lang];
+
+function setLang(l) {
+    lang = l;
+    T = I18N[l];
+    document.documentElement.lang = l;
+    document.getElementById('langEN').classList.toggle('active', l === 'en');
+    document.getElementById('langJA').classList.toggle('active', l === 'ja');
+    document.getElementById('loadBtn').textContent     = T.loadBtn;
+    document.getElementById('resetBtn').innerHTML      = T.resetBtn;
+    document.getElementById('settingsBtn').textContent = T.settingsBtn;
+    document.getElementById('thinkingLabel').firstChild.textContent = T.thinkingLabel + ' ';
+    document.querySelector('#thinkingMode option[value="suppress"]').textContent = T.thinkSuppress;
+    document.querySelector('#thinkingMode option[value="shorten"]').textContent  = T.thinkShorten;
+    document.querySelector('#thinkingMode option[value="full"]').textContent     = T.thinkFull;
+    document.getElementById('systemLabel').firstChild.textContent = T.systemLabel + ' ';
+    document.getElementById('systemPrompt').placeholder = T.systemPh;
+    document.getElementById('messageInput').placeholder = T.inputPh;
+    document.getElementById('sendBtn').textContent = T.sendBtn;
+    document.getElementById('stopBtn').textContent = T.stopBtn;
+    const ms = document.getElementById('modelStatus');
+    if (!engine) ms.textContent = T.noModel;
+}
+
 let engine = null;
 let conversationHistory = [];
 let isGenerating = false;
@@ -110,7 +189,7 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
     const progressBar = document.getElementById('progressBar');
     const progressFill = document.getElementById('progressFill');
 
-    statusEl.textContent = '読み込み中...';
+    statusEl.textContent = T.loading;
     statusEl.className = '';
     progressBar.style.display = 'block';
     progressFill.style.width = '5%';
@@ -157,7 +236,7 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
         const moeLabel = engine.isMoE ? ' MoE' : '';
         // For LFM2, show hybrid layer info
         const hybridLabel = isLfm2 ? ` (${arch.shortconvLCache > 0 ? '18conv+6attn' : 'hybrid'})` : '';
-        statusEl.textContent = `${gguf.getKeyValue('general.name', file.name)} | ${arch.blockCount}L ${arch.embeddingLength}d${moeLabel}${hybridLabel}${gpuLabel} | 準備OK`;
+        statusEl.textContent = `${gguf.getKeyValue('general.name', file.name)} | ${arch.blockCount}L ${arch.embeddingLength}d${moeLabel}${hybridLabel}${gpuLabel} | ${T.ready}`;
         statusEl.className = 'ready';
 
         document.getElementById('messageInput').disabled = false;
@@ -166,8 +245,8 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
 
         setTimeout(() => { progressBar.style.display = 'none'; }, 500);
     } catch (err) {
-        console.error('GGUF読み込みエラー:', err);
-        statusEl.textContent = `エラー: ${err.message}`;
+        console.error('GGUF load error:', err);
+        statusEl.textContent = `${T.loadError} ${err.message}`;
         statusEl.className = '';
         progressBar.style.display = 'none';
     }
@@ -290,7 +369,7 @@ async function sendMessage() {
             onPrefill(done, total) {
                 if (total <= 1) return;
                 const pct = Math.round(done / total * 100);
-                statsBar.textContent = `⏳ prefill中... ${done}/${total} tokens (${pct}%)`;
+                statsBar.textContent = T.prefilling(done, total, pct);
                 statsBar.className = 'visible';
             },
             onToken(tokenId) {
@@ -305,9 +384,9 @@ async function sendMessage() {
             },
         });
     } catch (err) {
-        console.error('生成エラー:', err);
+        console.error(T.genError, err);
         if (err.name !== 'AbortError') {
-            assistantEl.textContent += ` [エラー: ${err.message}]`;
+            assistantEl.textContent += T.inlineError(err.message);
         }
     }
 
@@ -321,7 +400,7 @@ async function sendMessage() {
 
     console.log(`[PERF] total=${elapsed}s, tokens=${tokenCount}, ${tps} tok/s`);
 
-    statsBar.textContent = `⚡ ${tokenCount} tokens / ${elapsed}s (${tps} tok/s)`;
+    statsBar.textContent = T.stats(tokenCount, elapsed, tps);
     statsBar.className = 'visible';
 
     isGenerating = false;
@@ -343,6 +422,9 @@ document.addEventListener('keydown', (e) => {
         stopGeneration();
     }
 });
+
+// Apply initial language
+setLang(lang);
 </script>
 
 </body>
